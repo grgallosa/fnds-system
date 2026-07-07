@@ -1,4 +1,5 @@
 import { Router } from "express";
+import rateLimit from "express-rate-limit";
 import { eq } from "drizzle-orm";
 import { db } from "../../db/index.ts";
 import { users, technicians } from "../../db/schema.ts";
@@ -11,8 +12,20 @@ import { requireAuth } from "../middleware/auth.ts";
 
 const router = Router();
 
+// Throttle brute-force login attempts per IP. Deliberately scoped to just
+// this route - /me doesn't take a password, so there's nothing to
+// brute-force there and no reason to rate-limit it.
+const loginRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  limit: 10, // 10 attempts per IP per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many login attempts. Please try again later." },
+});
+
 router.post(
   "/login",
+  loginRateLimiter,
   validateBody(loginSchema),
   asyncHandler(async (req, res) => {
     const { username, password } = req.body;

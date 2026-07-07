@@ -1,58 +1,19 @@
 import { Router } from "express";
 import { sql, eq, and } from "drizzle-orm";
 import { db } from "../../db/index.ts";
-import { invoices, expenses, customers, repairTasks } from "../../db/schema.ts";
+import { invoices, customers } from "../../db/schema.ts";
 import { requireAdmin } from "../middleware/auth.ts";
 import { asyncHandler } from "../utils/asyncHandler.ts";
 import { todayStr } from "../utils/billing.ts";
 
 const router = Router();
 
-// Real aggregates computed in SQL, not guessed/hardcoded on the client.
-router.get(
-  "/summary",
-  requireAdmin,
-  asyncHandler(async (_req, res) => {
-    const [revenue] = await db
-      .select({ total: sql<string>`coalesce(sum(${invoices.amount}), 0)` })
-      .from(invoices)
-      .where(eq(invoices.status, "Paid"));
-
-    const [pending] = await db
-      .select({ total: sql<string>`coalesce(sum(${invoices.amount}), 0)` })
-      .from(invoices)
-      .where(eq(invoices.status, "Unpaid"));
-
-    const [overdue] = await db
-      .select({ total: sql<string>`coalesce(sum(${invoices.amount}), 0)` })
-      .from(invoices)
-      .where(eq(invoices.status, "Overdue"));
-
-    const [expenseTotal] = await db
-      .select({ total: sql<string>`coalesce(sum(${expenses.amount}), 0)` })
-      .from(expenses);
-
-    const [customerCount] = await db
-      .select({ count: sql<string>`count(*)` })
-      .from(customers)
-      .where(eq(customers.status, "Active"));
-
-    const [openTasks] = await db
-      .select({ count: sql<string>`count(*)` })
-      .from(repairTasks)
-      .where(sql`${repairTasks.status} not in ('Completed', 'Cancelled')`);
-
-    res.json({
-      totalRevenue: Number(revenue.total),
-      pendingRevenue: Number(pending.total),
-      overdueRevenue: Number(overdue.total),
-      totalExpenses: Number(expenseTotal.total),
-      netIncome: Number(revenue.total) - Number(expenseTotal.total),
-      activeCustomers: Number(customerCount.count),
-      openTasks: Number(openTasks.count),
-    });
-  })
-);
+// Note: a server-computed `/summary` endpoint used to live here, but it was
+// never called by the frontend - DashboardTab.tsx independently recomputes
+// the same metrics (revenue, net income, outstanding balance) client-side
+// from state.invoices/state.expenses, and that computation is correct and
+// already covers this. Removed rather than keeping two definitions of
+// "revenue" that could silently drift (see production readiness audit).
 
 // Dedicated billing dashboard metrics: due today/this week, overdue
 // customers, outstanding balance, expected vs. collected monthly revenue.

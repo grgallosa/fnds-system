@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { eq } from "drizzle-orm";
 import { db } from "../../db/index.ts";
-import { invoices, customers } from "../../db/schema.ts";
+import { invoices, customers, payments } from "../../db/schema.ts";
 import { requireAdmin } from "../middleware/auth.ts";
 import { validateBody } from "../middleware/validate.ts";
 import {
@@ -158,6 +158,23 @@ router.delete(
   asyncHandler(async (req, res) => {
     const [existing] = await db.select().from(invoices).where(eq(invoices.id, req.params.id));
     if (!existing) throw notFound("Invoice");
+
+    // payments.invoiceId is onDelete: "restrict" (permanent audit record -
+    // see schema.ts), so deleting a paid invoice with payment history would
+    // otherwise throw an unhandled FK violation. Check explicitly and
+    // reject with a clear 409 instead.
+    const [existingPayment] = await db
+      .select({ id: payments.id })
+      .from(payments)
+      .where(eq(payments.invoiceId, req.params.id))
+      .limit(1);
+    if (existingPayment) {
+      throw new ApiError(
+        409,
+        "Cannot delete an invoice with payment history. Cancel it instead."
+      );
+    }
+
     await db.delete(invoices).where(eq(invoices.id, req.params.id));
     res.status(204).send();
   })

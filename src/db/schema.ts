@@ -8,6 +8,7 @@ import {
   boolean,
   pgEnum,
   uniqueIndex,
+  index,
 } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
 
@@ -108,40 +109,53 @@ export const plans = pgTable("plans", {
 // ---------------------------------------------------------------------------
 // Customers
 // ---------------------------------------------------------------------------
-export const customers = pgTable("customers", {
-  id: text("id").primaryKey(), // e.g. CUST-1001
-  fullName: text("full_name").notNull(),
-  address: text("address").notNull(),
-  contactNumber: text("contact_number").notNull(),
-  email: text("email").notNull(),
-  installationDate: text("installation_date").notNull(),
-  currentPlanId: text("current_plan_id").references(() => plans.id, {
-    onDelete: "restrict",
-  }),
-  monthlyFee: numeric("monthly_fee", { precision: 10, scale: 2 }).notNull(),
-  status: customerStatusEnum("status").notNull().default("Active"),
-  username: text("username"),
+export const customers = pgTable(
+  "customers",
+  {
+    id: text("id").primaryKey(), // e.g. CUST-1001
+    fullName: text("full_name").notNull(),
+    address: text("address").notNull(),
+    contactNumber: text("contact_number").notNull(),
+    email: text("email").notNull(),
+    installationDate: text("installation_date").notNull(),
+    currentPlanId: text("current_plan_id").references(() => plans.id, {
+      onDelete: "restrict",
+    }),
+    monthlyFee: numeric("monthly_fee", { precision: 10, scale: 2 }).notNull(),
+    status: customerStatusEnum("status").notNull().default("Active"),
+    username: text("username"),
 
-  // --- Recurring monthly billing schedule -----------------------------
-  // The date the customer's monthly billing cycle begins (usually the
-  // installation/activation date). The day-of-month of this date is the
-  // customer's recurring "due day" every month going forward.
-  billingStartDate: text("billing_start_date").notNull(),
-  // 1-31. Normally derived from billingStartDate, but stored explicitly so
-  // it can be overridden independently (e.g. an admin wants billing on the
-  // 1st regardless of when the customer was actually installed).
-  dueDay: integer("due_day").notNull(),
-  // The next date this customer owes a payment. Advances automatically
-  // (by one month, clamped to short months) every time their current
-  // invoice is marked Paid.
-  nextDueDate: text("next_due_date").notNull(),
-  // Rollup of standing relative to nextDueDate, recomputed by the billing
-  // scheduler/service rather than trusted from client input.
-  billingStatus: billingStatusEnum("billing_status").notNull().default("Current"),
+    // --- Recurring monthly billing schedule -----------------------------
+    // The date the customer's monthly billing cycle begins (usually the
+    // installation/activation date). The day-of-month of this date is the
+    // customer's recurring "due day" every month going forward.
+    billingStartDate: text("billing_start_date").notNull(),
+    // 1-31. Normally derived from billingStartDate, but stored explicitly so
+    // it can be overridden independently (e.g. an admin wants billing on the
+    // 1st regardless of when the customer was actually installed).
+    dueDay: integer("due_day").notNull(),
+    // The next date this customer owes a payment. Advances automatically
+    // (by one month, clamped to short months) every time their current
+    // invoice is marked Paid.
+    nextDueDate: text("next_due_date").notNull(),
+    // Rollup of standing relative to nextDueDate, recomputed by the billing
+    // scheduler/service rather than trusted from client input.
+    billingStatus: billingStatusEnum("billing_status").notNull().default("Current"),
 
-  createdAt: timestamp("created_at").defaultNow().notNull(),
-  updatedAt: timestamp("updated_at").defaultNow().notNull(),
-});
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    // Targeted indexes for the hot billing/report query patterns (see
+    // reports.routes.ts, billing.service.ts). Added via `npm run db:push` -
+    // fine as a blocking operation at this table's current size; if this
+    // table ever grows into the millions of rows, create these manually
+    // with `CREATE INDEX CONCURRENTLY` instead so the table isn't locked.
+    nextDueDateIdx: index("customers_next_due_date_idx").on(table.nextDueDate),
+    statusIdx: index("customers_status_idx").on(table.status),
+    billingStatusIdx: index("customers_billing_status_idx").on(table.billingStatus),
+  })
+);
 
 // ---------------------------------------------------------------------------
 // Technicians
@@ -189,6 +203,20 @@ export const invoices = pgTable(
     invoiceNumberUnique: uniqueIndex("invoices_invoice_number_unique").on(
       table.invoiceNumber
     ),
+    // Closes the TOCTOU race in createInvoiceForCycle's select-then-insert:
+    // guarantees at most one invoice per customer per due date at the DB
+    // level, not just in application code. See
+    // src/server/migrations/add-invoice-cycle-unique-index.ts for the
+    // one-time migration that adds this safely on a populated table, and
+    // billing.service.ts#createInvoiceForCycle for the unique-violation
+    // handling that treats a conflict here as "already exists".
+    customerDueDateUnique: uniqueIndex("invoices_customer_id_due_date_unique").on(
+      table.customerId,
+      table.dueDate
+    ),
+    statusIdx: index("invoices_status_idx").on(table.status),
+    dueDateIdx: index("invoices_due_date_idx").on(table.dueDate),
+    customerIdIdx: index("invoices_customer_id_idx").on(table.customerId),
   })
 );
 

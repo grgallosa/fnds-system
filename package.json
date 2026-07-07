@@ -11,7 +11,8 @@
     "lint": "tsc --noEmit",
     "db:push": "drizzle-kit push --config=src/db/drizzle.config.ts",
     "db:backfill-billing": "tsx src/server/backfill-billing.ts",
-    "db:seed": "tsx src/server/seed.ts"
+    "db:seed": "tsx src/server/seed.ts",
+    "test": "vitest run"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.14",
@@ -20,6 +21,7 @@
     "dotenv": "^17.2.3",
     "drizzle-orm": "^0.45.2",
     "express": "^4.21.2",
+    "express-rate-limit": "^7.4.1",
     "jsonwebtoken": "^9.0.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
@@ -44,6 +46,7 @@
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
-    "vite": "^6.2.3"
+    "vite": "^6.2.3",
+    "vitest": "^2.1.5"
   }
 }

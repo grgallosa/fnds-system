@@ -1,14 +1,14 @@
 import { Router } from "express";
 import { eq } from "drizzle-orm";
 import { db } from "../../db/index.ts";
-import { customers } from "../../db/schema.ts";
+import { customers, payments } from "../../db/schema.ts";
 import { requireAuth, requireAdmin } from "../middleware/auth.ts";
 import { validateBody } from "../middleware/validate.ts";
 import { customerCreateSchema, customerUpdateSchema } from "../validation/schemas.ts";
 import { asyncHandler, ApiError, notFound } from "../utils/asyncHandler.ts";
 import { ids } from "../utils/ids.ts";
 import { recordActivity, recordAudit } from "../utils/activity.ts";
-import { deriveDueDay, computeBillingStatus } from "../utils/billing.ts";
+import { deriveDueDay, computeBillingStatus, todayStr } from "../utils/billing.ts";
 import { generateFirstInvoiceForCustomer } from "../services/billing.service.ts";
 
 const router = Router();
@@ -130,11 +130,29 @@ router.put(
       .where(eq(customers.id, req.params.id))
       .returning();
 
-    // Reactivating a customer (Suspended/Disconnected -> Active) should
-    // make sure they have an invoice waiting for their current cycle,
-    // same as a brand new customer.
+    // Reactivating a customer (Suspended/Disconnected -> Active): reset
+    // their billing cycle to start today rather than keeping a stale
+    // nextDueDate from before the suspension. Deliberate choice - the
+    // billing cycle restarts from the day of reactivation; there is no
+    // retroactive charge for the time the customer was suspended, and no
+    // proration of the partial final cycle before suspension either. This
+    // also prevents them from showing as Overdue the instant they're
+    // reactivated just because of stale suspended-period math.
+    let reactivatedCustomer = updated;
     if (body.status === "Active" && existing.status !== "Active") {
-      await generateFirstInvoiceForCustomer(updated);
+      const resetNextDueDate = todayStr();
+      const resetBillingStatus = computeBillingStatus(resetNextDueDate);
+      const [refreshed] = await db
+        .update(customers)
+        .set({
+          nextDueDate: resetNextDueDate,
+          billingStatus: resetBillingStatus,
+          updatedAt: new Date(),
+        })
+        .where(eq(customers.id, req.params.id))
+        .returning();
+      reactivatedCustomer = refreshed;
+      await generateFirstInvoiceForCustomer(reactivatedCustomer);
     }
 
     await recordActivity(req.user!, "Modified customer record", req.params.id);
@@ -152,7 +170,7 @@ router.put(
       await recordAudit(req.user!, "Modified Subscriber Account", `Customer: ${req.params.id}`, changes.join(", "));
     }
 
-    res.json(updated);
+    res.json(reactivatedCustomer);
   })
 );
 
@@ -163,10 +181,27 @@ router.delete(
     const [existing] = await db.select().from(customers).where(eq(customers.id, req.params.id));
     if (!existing) throw notFound("Customer");
 
-    // Customers can be deleted even if they have existing invoices or repair
-    // tasks. The schema defines onDelete: "cascade" for invoices, repairTasks,
-    // and customerTimelineEvents referencing customers.id, so the database
-    // removes those dependent rows automatically as part of this delete.
+    // Customers can be hard-deleted only if they have never made a payment.
+    // Invoices/repairTasks/customerTimelineEvents referencing this customer
+    // are onDelete: "cascade" and would be removed automatically, but
+    // payments are onDelete: "restrict" (permanent audit record - see
+    // schema.ts) - and since a customer's invoices cascade-delete along with
+    // the customer, any payment row referencing one of those invoices would
+    // block the DB delete with an FK violation. Check explicitly and reject
+    // with a clear message instead of letting that violation surface as a
+    // generic 500.
+    const [existingPayment] = await db
+      .select({ id: payments.id })
+      .from(payments)
+      .where(eq(payments.customerId, req.params.id))
+      .limit(1);
+    if (existingPayment) {
+      throw new ApiError(
+        409,
+        "Cannot delete a customer with payment history. Suspend or disconnect them instead."
+      );
+    }
+
     await db.delete(customers).where(eq(customers.id, req.params.id));
 
     await recordActivity(req.user!, "Deleted customer account", req.params.id);
