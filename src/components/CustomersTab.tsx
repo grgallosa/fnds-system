@@ -54,7 +54,7 @@ interface CustomersTabProps {
     customer: Omit<Customer, "id" | "nextDueDate" | "billingStatus" | "billingStartDate" | "dueDay"> &
       Partial<Pick<Customer, "billingStartDate" | "dueDay">>
   ) => void;
-  onUpdateCustomer: (id: string, updates: Partial<Customer>) => void;
+  onUpdateCustomer: (id: string, updates: Partial<Customer>) => void | Promise<void>;
   onAddTimelineEvent: (customerId: string, action: string, description: string) => void;
   onTriggerTaskForCustomer: (customer: Customer) => void;
   onDeleteCustomer?: (id: string) => void | Promise<void>;
@@ -394,6 +394,14 @@ export default function CustomersTab({
     }
   }, [activeDetailsId, selectedCustomer?.id]);
 
+  // Keep billing fields in sync after a successful save (server state updates in place)
+  React.useEffect(() => {
+    if (selectedCustomer && !isEditMode) {
+      setEditBillingStartDate(selectedCustomer.billingStartDate);
+      setEditDueDay(String(selectedCustomer.dueDay));
+    }
+  }, [selectedCustomer?.billingStartDate, selectedCustomer?.dueDay, selectedCustomer?.id, isEditMode]);
+
   const handleEditPlanChange = (planId: string) => {
     setEditPlanId(planId);
     const plan = state.plans.find((p) => p.id === planId);
@@ -402,32 +410,36 @@ export default function CustomersTab({
     }
   };
 
-  const handleEditSubmit = (e: React.FormEvent) => {
+  const handleEditSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editFullName || !editAddress || !editPhone || !editEmail) {
       alert("Please fill in all fields.");
       return;
     }
 
-    onUpdateCustomer(selectedCustomer!.id, {
-      fullName: editFullName,
-      address: editAddress,
-      contactNumber: editPhone,
-      email: editEmail,
-      currentPlanId: editPlanId,
-      monthlyFee: Number(editFee),
-      username: editUsername || editEmail.split("@")[0],
-      billingStartDate: editBillingStartDate || undefined,
-      dueDay: editDueDay ? Number(editDueDay) : undefined,
-    });
+    try {
+      await onUpdateCustomer(selectedCustomer!.id, {
+        fullName: editFullName,
+        address: editAddress,
+        contactNumber: editPhone,
+        email: editEmail,
+        currentPlanId: editPlanId,
+        monthlyFee: Number(editFee),
+        username: editUsername || editEmail.split("@")[0],
+        billingStartDate: editBillingStartDate || undefined,
+        dueDay: editDueDay ? Number(editDueDay) : undefined,
+      });
 
-    onAddTimelineEvent(
-      selectedCustomer!.id,
-      "Profile Updated",
-      "Account contact information, address and plan details were updated by Administrator."
-    );
+      onAddTimelineEvent(
+        selectedCustomer!.id,
+        "Profile Updated",
+        "Account contact information, address and plan details were updated by Administrator."
+      );
 
-    setIsEditMode(false);
+      setIsEditMode(false);
+    } catch (err: any) {
+      alert(err?.message || "Failed to save customer changes.");
+    }
   };
 
   const handleDeleteCustomer = async (id: string) => {
@@ -848,7 +860,14 @@ export default function CustomersTab({
                         <input
                           type="date"
                           value={editBillingStartDate}
-                          onChange={(e) => setEditBillingStartDate(e.target.value)}
+                          onChange={(e) => {
+                            const newDate = e.target.value;
+                            setEditBillingStartDate(newDate);
+                            if (newDate) {
+                              const day = Number(newDate.split("-")[2]);
+                              if (day >= 1 && day <= 31) setEditDueDay(String(day));
+                            }
+                          }}
                           className="mt-1 w-full h-9 rounded-xl border border-slate-800 bg-slate-950 text-slate-100 px-2.5 text-xs outline-none focus:border-blue-500/60"
                         />
                       </div>
@@ -909,6 +928,23 @@ export default function CustomersTab({
                   <div className="flex items-center gap-2.5 border-t border-slate-800/60 pt-3">
                     <Calendar className="h-4.5 w-4.5 text-slate-500 shrink-0" />
                     <span>Installed: <strong className="text-slate-200">{selectedCustomer.installationDate}</strong></span>
+                  </div>
+                  <div className="rounded-xl border border-slate-800/60 bg-slate-950/40 p-3 space-y-2">
+                    <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wide">
+                      Monthly Billing Schedule
+                    </div>
+                    <div className="flex items-center gap-2.5">
+                      <Calendar className="h-4 w-4 text-slate-500 shrink-0" />
+                      <span>Billing Start: <strong className="text-slate-200">{selectedCustomer.billingStartDate}</strong></span>
+                    </div>
+                    <div className="flex items-center gap-2.5">
+                      <Clock className="h-4 w-4 text-slate-500 shrink-0" />
+                      <span>Due Day: <strong className="text-slate-200 font-mono">{selectedCustomer.dueDay}</strong> of each month</span>
+                    </div>
+                    <div className="flex items-center gap-2.5">
+                      <Calendar className="h-4 w-4 text-slate-500 shrink-0" />
+                      <span>Next Due: <strong className="text-slate-200">{selectedCustomer.nextDueDate}</strong></span>
+                    </div>
                   </div>
                   <div className="flex items-center gap-2.5">
                     <Layers className="h-4.5 w-4.5 text-slate-500 shrink-0" />

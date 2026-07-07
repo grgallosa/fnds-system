@@ -112,9 +112,15 @@ router.put(
     }
 
     // If the billing start date is being changed, re-derive the due day
-    // unless the caller explicitly supplied one in the same request.
+    // unless the caller explicitly supplied a different override in the same request.
     let dueDay: number | undefined = body.dueDay;
-    if (body.billingStartDate && dueDay === undefined) {
+    if (body.billingStartDate && body.billingStartDate !== existing.billingStartDate) {
+      const derivedNewDueDay = deriveDueDay(body.billingStartDate);
+      const oldDerivedDueDay = deriveDueDay(existing.billingStartDate);
+      if (dueDay === undefined || dueDay === oldDerivedDueDay) {
+        dueDay = derivedNewDueDay;
+      }
+    } else if (body.billingStartDate && dueDay === undefined) {
       dueDay = deriveDueDay(body.billingStartDate);
     }
 
