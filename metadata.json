@@ -1,0 +1,6 @@
+{
+  "name": "ISP Business Management System",
+  "description": "A centralized, modern system for managing ISP customers, technicians, internet plans, billing invoices, expenses, and business performance reporting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

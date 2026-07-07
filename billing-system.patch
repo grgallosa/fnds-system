@@ -1,0 +1,2509 @@
+diff --git a/BILLING_SYSTEM.md b/BILLING_SYSTEM.md
+new file mode 100644
+index 0000000..ad55485
+--- /dev/null
++++ b/BILLING_SYSTEM.md
+@@ -0,0 +1,55 @@
++# Monthly Billing & Due Date System
++
++This adds recurring monthly billing, due dates, invoices, and payments on
++top of the existing customer/plan schema.
++
++## What's new
++
++**Database** (`src/db/schema.ts`)
++- `customers` gains: `billing_start_date`, `due_day`, `next_due_date`, `billing_status` (Current / Due Soon / Overdue).
++- `invoices` gains: `invoice_number`, `billing_period_start`, `billing_period_end`, `payment_date`, `notes`. Status enum is now `Unpaid | Paid | Overdue | Cancelled` (renamed from `Pending`).
++- New `payments` table: permanent, one row per payment received, linked to an invoice and customer. Never deleted or edited by the app.
++
++**Business logic** (`src/server/utils/billing.ts`, `src/server/services/billing.service.ts`)
++- Pure date math for due-day rollover (e.g. billed on the 31st correctly rolls to Feb 28/29), next-due-date calculation, and billing-status rollup.
++- `runBillingCycle()`: marks overdue invoices, recomputes every customer's billing status, and generates any invoice whose cycle has arrived. Idempotent - safe to re-run.
++- `recordInvoicePayment()`: the full payment flow — marks the invoice Paid, writes a payment record, advances the customer's due date, and generates next month's invoice.
++
++**Automatic scheduling** (`src/server/utils/scheduler.ts`)
++This app has no external cron/queue infrastructure, so the billing cycle runs once on server boot and then once every 24 hours via `setInterval`. It's fully idempotent, so this is safe even across restarts. An admin can also trigger it on demand from the Billing tab ("Run Monthly Billing") or via `POST /api/invoices/generate-monthly`.
++
++**API additions**
++- `POST /api/invoices/:id/pay` — the only supported way to mark an invoice Paid; runs the full payment flow above.
++- `POST /api/invoices/generate-monthly` — manual trigger for the scheduler's generation step.
++- `GET /api/payments` — payment history (optionally `?customerId=`).
++- `GET /api/reports/billing-summary` — dashboard metrics: due today, due this week, overdue customers, outstanding balance, expected monthly revenue, collected this month.
++
++**Frontend**
++- Customer table: Next Due Date, Billing Status badge (🟢/🟡/🔴), Outstanding Balance, Last Payment columns.
++- Add/Edit customer forms: Billing Start Date + Due Day override fields.
++- Billing tab: invoice numbers, billing period range, "Run Monthly Billing" button, and a payment modal that captures payment date, reference number, and notes.
++- Dashboard: new "Recurring Billing" metrics row (due today/this week, overdue customers, outstanding balance, expected vs. collected monthly revenue).
++
++## Migrating an existing database
++
++This project's only schema tool is `drizzle-kit push` (no versioned migration
++files), which can't safely add the new `NOT NULL` columns to tables that
++already have rows. If your database already has customers/invoices in it,
++run this **once, before** `npm run db:push`:
++
++```bash
++npm run db:backfill-billing
++```
++
++It backfills `billing_start_date`/`due_day`/`next_due_date`/`billing_status`
++from each customer's installation date, assigns sequential invoice numbers
++and billing periods to existing invoices, creates the `payments` table, and
++only then locks in the `NOT NULL`/unique constraints. It's idempotent and
++safe to re-run.
++
++On a brand-new, empty database, just run `npm run db:push` directly.
++
++After migrating, run `npm run db:push` to sync any remaining schema
++differences, and optionally `POST /api/invoices/generate-monthly` (or wait
++for the daily scheduler tick) to generate any invoices for the current
++cycle.
+diff --git a/package.json b/package.json
+index 66b1cfd..629869e 100644
+--- a/package.json
++++ b/package.json
+@@ -10,6 +10,7 @@
+     "clean": "rm -rf dist server.js",
+     "lint": "tsc --noEmit",
+     "db:push": "drizzle-kit push --config=src/db/drizzle.config.ts",
++    "db:backfill-billing": "tsx src/server/backfill-billing.ts",
+     "db:seed": "tsx src/server/seed.ts"
+   },
+   "dependencies": {
+diff --git a/server.ts b/server.ts
+index 6b8cfa6..60f0f2f 100644
+--- a/server.ts
++++ b/server.ts
+@@ -7,6 +7,7 @@ import authRoutes from "./src/server/routes/auth.routes.ts";
+ import customersRoutes from "./src/server/routes/customers.routes.ts";
+ import plansRoutes from "./src/server/routes/plans.routes.ts";
+ import invoicesRoutes from "./src/server/routes/invoices.routes.ts";
++import paymentsRoutes from "./src/server/routes/payments.routes.ts";
+ import expensesRoutes from "./src/server/routes/expenses.routes.ts";
+ import techniciansRoutes from "./src/server/routes/technicians.routes.ts";
+ import tasksRoutes from "./src/server/routes/tasks.routes.ts";
+@@ -15,6 +16,7 @@ import notificationsRoutes from "./src/server/routes/notifications.routes.ts";
+ import reportsRoutes from "./src/server/routes/reports.routes.ts";
+ import timelineRoutes from "./src/server/routes/timeline.routes.ts";
+ import { errorHandler } from "./src/server/middleware/errorHandler.ts";
++import { startBillingScheduler } from "./src/server/utils/scheduler.ts";
+ 
+ async function startServer() {
+   const app = express();
+@@ -30,6 +32,7 @@ async function startServer() {
+   app.use("/api/customers", customersRoutes);
+   app.use("/api/plans", plansRoutes);
+   app.use("/api/invoices", invoicesRoutes);
++  app.use("/api/payments", paymentsRoutes);
+   app.use("/api/expenses", expensesRoutes);
+   app.use("/api/technicians", techniciansRoutes);
+   app.use("/api/tasks", tasksRoutes);
+@@ -65,6 +68,11 @@ async function startServer() {
+   app.listen(PORT, "0.0.0.0", () => {
+     console.log(`Server running on http://0.0.0.0:${PORT}`);
+   });
++
++  // Recurring monthly billing: marks overdue invoices, refreshes customer
++  // billing statuses, and generates invoices for any cycle that has
++  // arrived. Runs once immediately, then once a day (see scheduler.ts).
++  startBillingScheduler();
+ }
+ 
+ startServer();
+diff --git a/src/components/BillingTab.tsx b/src/components/BillingTab.tsx
+index 151bbf1..633d775 100644
+--- a/src/components/BillingTab.tsx
++++ b/src/components/BillingTab.tsx
+@@ -13,18 +13,21 @@ import {
+   Check,
+   Calendar,
+   Layers,
+-  Percent
++  Percent,
++  RefreshCw,
+ } from "lucide-react";
+ import { AppState, Invoice, Customer } from "../types";
+ 
+ interface BillingTabProps {
+   state: AppState;
+-  onAddInvoice: (invoice: Omit<Invoice, "id">) => void;
++  onAddInvoice: (invoice: Omit<Invoice, "id" | "invoiceNumber">) => void;
+   onRecordPayment: (
+     id: string,
+-    paymentMethod: "Cash" | "Bank Transfer" | "Credit Card" | "Mobile Wallet" | "Other"
++    paymentMethod: "Cash" | "Bank Transfer" | "Credit Card" | "Mobile Wallet" | "Other",
++    details?: { paymentDate?: string; referenceNumber?: string; notes?: string }
+   ) => void;
+   onCancelInvoice: (id: string) => void;
++  onGenerateMonthlyInvoices: () => Promise<number>;
+ }
+ 
+ export default function BillingTab({
+@@ -32,25 +35,41 @@ export default function BillingTab({
+   onAddInvoice,
+   onRecordPayment,
+   onCancelInvoice,
++  onGenerateMonthlyInvoices,
+ }: BillingTabProps) {
+   const [searchQuery, setSearchQuery] = useState("");
+   const [statusFilter, setStatusFilter] = useState<string>("All");
++  const [isGenerating, setIsGenerating] = useState(false);
+ 
+   // Record payment state
+   const [showPayModal, setShowPayModal] = useState(false);
+   const [selectedInvoice, setSelectedInvoice] = useState<Invoice | null>(null);
+   const [payMethod, setPayMethod] = useState<"Cash" | "Bank Transfer" | "Credit Card" | "Mobile Wallet" | "Other">("Mobile Wallet");
++  const [payReference, setPayReference] = useState("");
++  const [payNotes, setPayNotes] = useState("");
++  const [payDate, setPayDate] = useState(new Date().toISOString().slice(0, 10));
+ 
+   // Create invoice state
+   const [showCreateModal, setShowCreateModal] = useState(false);
+   const [invCustomerId, setInvCustomerId] = useState(state.customers[0]?.id || "");
+   const today = new Date();
+   const defaultDueDate = new Date(today.getFullYear(), today.getMonth(), 15).toISOString().slice(0, 10);
+-  const defaultPeriod = today.toLocaleString("en-US", { month: "long", year: "numeric" });
+-  const [invPeriod, setInvPeriod] = useState(defaultPeriod);
++  const defaultPeriodStart = new Date(today.getFullYear(), today.getMonth(), 1).toISOString().slice(0, 10);
++  const [invPeriodStart, setInvPeriodStart] = useState(defaultPeriodStart);
++  const [invPeriodEnd, setInvPeriodEnd] = useState(defaultDueDate);
+   const [invDueDate, setInvDueDate] = useState(defaultDueDate);
+   const [invAmount, setInvAmount] = useState(state.customers[0]?.monthlyFee || 1699);
+ 
++  const handleGenerateMonthly = async () => {
++    setIsGenerating(true);
++    try {
++      const count = await onGenerateMonthlyInvoices();
++      alert(`Generated ${count} invoice(s) for customers whose billing cycle is due.`);
++    } finally {
++      setIsGenerating(false);
++    }
++  };
++
+   // Sync amount when selecting customer in modal
+   const handleCustomerChangeInInvoice = (customerId: string) => {
+     setInvCustomerId(customerId);
+@@ -69,7 +88,7 @@ export default function BillingTab({
+     .reduce((sum, i) => sum + i.amount, 0);
+ 
+   const outstandingBalance = invoices
+-    .filter((i) => i.status === "Pending" || i.status === "Overdue")
++    .filter((i) => i.status === "Unpaid" || i.status === "Overdue")
+     .reduce((sum, i) => sum + i.amount, 0);
+ 
+   const collectionRate =
+@@ -80,7 +99,7 @@ export default function BillingTab({
+   // Revenue collected today
+   const todayStr = new Date().toISOString().slice(0, 10);
+   const revenueToday = invoices
+-    .filter((i) => i.status === "Paid" && i.paidDate === todayStr)
++    .filter((i) => i.status === "Paid" && i.paymentDate === todayStr)
+     .reduce((sum, i) => sum + i.amount, 0);
+ 
+   const averageRevenuePerCustomer =
+@@ -96,10 +115,11 @@ export default function BillingTab({
+     onAddInvoice({
+       customerId: invCustomerId,
+       customerName: customer.fullName,
+-      billingPeriod: invPeriod,
++      billingPeriodStart: invPeriodStart,
++      billingPeriodEnd: invPeriodEnd,
+       dueDate: invDueDate,
+       amount: Number(invAmount),
+-      status: "Pending",
++      status: "Unpaid",
+     });
+ 
+     setShowCreateModal(false);
+@@ -109,14 +129,21 @@ export default function BillingTab({
+     e.preventDefault();
+     if (!selectedInvoice) return;
+ 
+-    onRecordPayment(selectedInvoice.id, payMethod);
++    onRecordPayment(selectedInvoice.id, payMethod, {
++      paymentDate: payDate,
++      referenceNumber: payReference || undefined,
++      notes: payNotes || undefined,
++    });
+     setShowPayModal(false);
+     setSelectedInvoice(null);
++    setPayReference("");
++    setPayNotes("");
+   };
+ 
+   const filteredInvoices = invoices.filter((i) => {
+     const matchesSearch =
+       i.id.toLowerCase().includes(searchQuery.toLowerCase()) ||
++      i.invoiceNumber.toLowerCase().includes(searchQuery.toLowerCase()) ||
+       i.customerName.toLowerCase().includes(searchQuery.toLowerCase()) ||
+       i.customerId.toLowerCase().includes(searchQuery.toLowerCase());
+ 
+@@ -138,13 +165,24 @@ export default function BillingTab({
+             Collect subscriber fees, post outstanding balances, and audit payment methods.
+           </p>
+         </div>
+-        <button
+-          onClick={() => setShowCreateModal(true)}
+-          className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-blue-500/20 hover:bg-blue-500 transition-colors cursor-pointer"
+-        >
+-          <Plus className="h-4.5 w-4.5" />
+-          Generate Invoice
+-        </button>
++        <div className="flex items-center gap-2">
++          <button
++            onClick={handleGenerateMonthly}
++            disabled={isGenerating}
++            className="inline-flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-900 px-4 py-2.5 text-sm font-semibold text-slate-300 hover:bg-slate-800 transition-colors cursor-pointer disabled:opacity-50"
++            title="Generate invoices for any customer whose monthly cycle is due (runs automatically every day, too)"
++          >
++            <RefreshCw className={`h-4 w-4 ${isGenerating ? "animate-spin" : ""}`} />
++            Run Monthly Billing
++          </button>
++          <button
++            onClick={() => setShowCreateModal(true)}
++            className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-blue-500/20 hover:bg-blue-500 transition-colors cursor-pointer"
++          >
++            <Plus className="h-4.5 w-4.5" />
++            Generate Invoice
++          </button>
++        </div>
+       </div>
+ 
+       {/* Sales Dashboard Metrics Widgets */}
+@@ -174,7 +212,7 @@ export default function BillingTab({
+           <h3 className="text-lg font-semibold text-slate-100 mt-2">
+             ₱{outstandingBalance.toLocaleString("en-US", { minimumFractionDigits: 2 })}
+           </h3>
+-          <p className="text-xxs text-slate-500 mt-1">Invoices in Pending or Overdue states</p>
++          <p className="text-xxs text-slate-500 mt-1">Invoices in Unpaid or Overdue states</p>
+         </div>
+ 
+         {/* Collection Rate */}
+@@ -230,7 +268,7 @@ export default function BillingTab({
+         >
+           <option value="All">All Invoices</option>
+           <option value="Paid">Paid</option>
+-          <option value="Pending">Pending</option>
++          <option value="Unpaid">Unpaid</option>
+           <option value="Overdue">Overdue</option>
+           <option value="Cancelled">Cancelled</option>
+         </select>
+@@ -266,7 +304,7 @@ export default function BillingTab({
+                   >
+                     {/* Invoice ID */}
+                     <td className="px-6 py-4 font-mono text-xs font-bold text-slate-300">
+-                      {inv.id}
++                      {inv.invoiceNumber}
+                     </td>
+                     {/* Customer */}
+                     <td className="px-6 py-4">
+@@ -279,7 +317,7 @@ export default function BillingTab({
+                     </td>
+                     {/* Period */}
+                     <td className="px-6 py-4 text-slate-300">
+-                      {inv.billingPeriod}
++                      {inv.billingPeriodStart} &rarr; {inv.billingPeriodEnd}
+                     </td>
+                     {/* Due Date */}
+                     <td className="px-6 py-4 text-slate-400">
+@@ -294,7 +332,7 @@ export default function BillingTab({
+                       <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xxs font-semibold leading-none ${
+                         inv.status === "Paid"
+                           ? "bg-green-500/15 text-green-400"
+-                          : inv.status === "Pending"
++                          : inv.status === "Unpaid"
+                           ? "bg-yellow-500/15 text-yellow-400"
+                           : inv.status === "Overdue"
+                           ? "bg-red-500/15 text-red-400"
+@@ -304,7 +342,7 @@ export default function BillingTab({
+                       </span>
+                       {inv.status === "Paid" && (
+                         <div className="text-[10px] text-slate-500 font-mono mt-1">
+-                          Via {inv.paymentMethod} • {inv.paidDate}
++                          Via {inv.paymentMethod} • {inv.paymentDate}
+                         </div>
+                       )}
+                     </td>
+@@ -407,6 +445,46 @@ export default function BillingTab({
+                 </div>
+               </div>
+ 
++              <div className="grid grid-cols-2 gap-3">
++                <div>
++                  <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide">
++                    Payment Date
++                  </label>
++                  <input
++                    type="date"
++                    required
++                    value={payDate}
++                    onChange={(e) => setPayDate(e.target.value)}
++                    className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-900 text-slate-100 px-3 py-2.5 text-sm outline-none focus:border-blue-500/60"
++                  />
++                </div>
++                <div>
++                  <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide">
++                    Reference No.
++                  </label>
++                  <input
++                    type="text"
++                    placeholder="Optional"
++                    value={payReference}
++                    onChange={(e) => setPayReference(e.target.value)}
++                    className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-900 text-slate-100 px-3 py-2.5 text-sm outline-none focus:border-blue-500/60 placeholder:text-slate-600"
++                  />
++                </div>
++              </div>
++
++              <div>
++                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide">
++                  Notes
++                </label>
++                <textarea
++                  placeholder="Optional"
++                  value={payNotes}
++                  onChange={(e) => setPayNotes(e.target.value)}
++                  rows={2}
++                  className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-900 text-slate-100 px-3 py-2.5 text-sm outline-none focus:border-blue-500/60 placeholder:text-slate-600 resize-none"
++                />
++              </div>
++
+               <div className="flex gap-3 pt-3">
+                 <button
+                   type="button"
+@@ -465,32 +543,44 @@ export default function BillingTab({
+               <div className="grid grid-cols-2 gap-3">
+                 <div>
+                   <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide">
+-                    Billing Period
++                    Period Start
+                   </label>
+                   <input
+-                    type="text"
++                    type="date"
+                     required
+-                    placeholder="e.g. July 2026"
+-                    value={invPeriod}
+-                    onChange={(e) => setInvPeriod(e.target.value)}
+-                    className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-900 text-slate-100 px-3 py-2.5 text-sm outline-none focus:border-blue-500/60 placeholder:text-slate-600"
++                    value={invPeriodStart}
++                    onChange={(e) => setInvPeriodStart(e.target.value)}
++                    className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-900 text-slate-100 px-3 py-2.5 text-sm outline-none focus:border-blue-500/60"
+                   />
+                 </div>
+ 
+                 <div>
+                   <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide">
+-                    Due Date
++                    Period End
+                   </label>
+                   <input
+                     type="date"
+                     required
+-                    value={invDueDate}
+-                    onChange={(e) => setInvDueDate(e.target.value)}
++                    value={invPeriodEnd}
++                    onChange={(e) => setInvPeriodEnd(e.target.value)}
+                     className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-900 text-slate-100 px-3 py-2.5 text-sm outline-none focus:border-blue-500/60"
+                   />
+                 </div>
+               </div>
+ 
++              <div>
++                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide">
++                  Due Date
++                </label>
++                <input
++                  type="date"
++                  required
++                  value={invDueDate}
++                  onChange={(e) => setInvDueDate(e.target.value)}
++                  className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-900 text-slate-100 px-3 py-2.5 text-sm outline-none focus:border-blue-500/60"
++                />
++              </div>
++
+               <div>
+                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide">
+                   Invoice Amount (₱)
+diff --git a/src/components/CustomersTab.tsx b/src/components/CustomersTab.tsx
+index b6adfe2..52b772e 100644
+--- a/src/components/CustomersTab.tsx
++++ b/src/components/CustomersTab.tsx
+@@ -24,11 +24,36 @@ import {
+   Trash2
+ } from "lucide-react";
+ import * as XLSX from "xlsx";
+-import { AppState, Customer, InternetPlan, CustomerTimelineEvent, Invoice } from "../types";
++import { AppState, Customer, InternetPlan, CustomerTimelineEvent, Invoice, BillingStatus } from "../types";
++
++/** Colored badge for a customer's billing standing (🟢 Current / 🟡 Due Soon / 🔴 Overdue). */
++function BillingStatusBadge({ status }: { status: BillingStatus }) {
++  const styles: Record<BillingStatus, string> = {
++    Current: "bg-green-500/15 text-green-400",
++    "Due Soon": "bg-yellow-500/15 text-yellow-400",
++    Overdue: "bg-red-500/15 text-red-400",
++  };
++  const dotStyles: Record<BillingStatus, string> = {
++    Current: "bg-green-400",
++    "Due Soon": "bg-yellow-400",
++    Overdue: "bg-red-400",
++  };
++  return (
++    <span
++      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold leading-none ${styles[status]}`}
++    >
++      <span className={`h-1.5 w-1.5 rounded-full ${dotStyles[status]}`} />
++      {status}
++    </span>
++  );
++}
+ 
+ interface CustomersTabProps {
+   state: AppState;
+-  onAddCustomer: (customer: Omit<Customer, "id">) => void;
++  onAddCustomer: (
++    customer: Omit<Customer, "id" | "nextDueDate" | "billingStatus" | "billingStartDate" | "dueDay"> &
++      Partial<Pick<Customer, "billingStartDate" | "dueDay">>
++  ) => void;
+   onUpdateCustomer: (id: string, updates: Partial<Customer>) => void;
+   onAddTimelineEvent: (customerId: string, action: string, description: string) => void;
+   onTriggerTaskForCustomer: (customer: Customer) => void;
+@@ -61,6 +86,13 @@ export default function CustomersTab({
+   const [newPlanId, setNewPlanId] = useState(state.plans[0]?.id || "");
+   const [newFee, setNewFee] = useState(state.plans[0]?.monthlyPrice || 29.99);
+   const [newStatus, setNewStatus] = useState<"Active" | "Suspended" | "Disconnected">("Active");
++  const [newInstallationDate, setNewInstallationDate] = useState<string>(
++    new Date().toISOString().slice(0, 10)
++  );
++  // Billing start date defaults to the installation date; due day is
++  // derived server-side from it unless the admin overrides it explicitly.
++  const [newBillingStartDate, setNewBillingStartDate] = useState<string>("");
++  const [newDueDayOverride, setNewDueDayOverride] = useState<string>("");
+ 
+   // Selected customer for detailed view side drawer
+   const [activeDetailsId, setActiveDetailsId] = useState<string | null>(selectedCustomerId || null);
+@@ -74,6 +106,8 @@ export default function CustomersTab({
+   const [editPlanId, setEditPlanId] = useState("");
+   const [editFee, setEditFee] = useState<number>(0);
+   const [editUsername, setEditUsername] = useState("");
++  const [editBillingStartDate, setEditBillingStartDate] = useState("");
++  const [editDueDay, setEditDueDay] = useState<string>("");
+ 
+   // Spreadsheet import states
+   interface ParsedCustomerRow {
+@@ -285,11 +319,13 @@ export default function CustomersTab({
+       address: newAddress,
+       contactNumber: newPhone,
+       email: newEmail,
+-      installationDate: new Date().toISOString().split("T")[0],
++      installationDate: newInstallationDate,
+       currentPlanId: newPlanId,
+       monthlyFee: Number(newFee),
+       status: newStatus,
+       username: newUsername || newEmail.split("@")[0] || newFullName.toLowerCase().replace(/\s+/g, "."),
++      billingStartDate: newBillingStartDate || undefined,
++      dueDay: newDueDayOverride ? Number(newDueDayOverride) : undefined,
+     });
+ 
+     // Reset Form
+@@ -298,6 +334,9 @@ export default function CustomersTab({
+     setNewPhone("");
+     setNewEmail("");
+     setNewUsername("");
++    setNewInstallationDate(new Date().toISOString().slice(0, 10));
++    setNewBillingStartDate("");
++    setNewDueDayOverride("");
+     setShowAddModal(false);
+   };
+ 
+@@ -349,6 +388,8 @@ export default function CustomersTab({
+       setEditPlanId(selectedCustomer.currentPlanId);
+       setEditFee(selectedCustomer.monthlyFee);
+       setEditUsername(selectedCustomer.username || selectedCustomer.email.split("@")[0]);
++      setEditBillingStartDate(selectedCustomer.billingStartDate);
++      setEditDueDay(String(selectedCustomer.dueDay));
+       setIsEditMode(false);
+     }
+   }, [activeDetailsId, selectedCustomer?.id]);
+@@ -376,6 +417,8 @@ export default function CustomersTab({
+       currentPlanId: editPlanId,
+       monthlyFee: Number(editFee),
+       username: editUsername || editEmail.split("@")[0],
++      billingStartDate: editBillingStartDate || undefined,
++      dueDay: editDueDay ? Number(editDueDay) : undefined,
+     });
+ 
+     onAddTimelineEvent(
+@@ -492,19 +535,29 @@ export default function CustomersTab({
+                 <th className="px-6 py-4">Internet Plan</th>
+                 <th className="px-6 py-4">Address & Contact</th>
+                 <th className="px-6 py-4">Status</th>
++                <th className="px-6 py-4">Next Due Date</th>
++                <th className="px-6 py-4">Billing Status</th>
++                <th className="px-6 py-4">Outstanding Balance</th>
++                <th className="px-6 py-4">Last Payment</th>
+                 <th className="px-6 py-4 text-right">Actions</th>
+               </tr>
+             </thead>
+             <tbody className="divide-y divide-slate-800/50 text-sm">
+               {filteredCustomers.length === 0 ? (
+                 <tr>
+-                  <td colSpan={6} className="px-6 py-10 text-center text-slate-500">
++                  <td colSpan={10} className="px-6 py-10 text-center text-slate-500">
+                     No customers found matching filters.
+                   </td>
+                 </tr>
+               ) : (
+                 filteredCustomers.map((cust) => {
+                   const plan = state.plans.find((p) => p.id === cust.currentPlanId);
++                  const outstandingBalance = state.invoices
++                    .filter((inv) => inv.customerId === cust.id && (inv.status === "Unpaid" || inv.status === "Overdue"))
++                    .reduce((sum, inv) => sum + inv.amount, 0);
++                  const lastPayment = state.payments
++                    .filter((p) => p.customerId === cust.id)
++                    .sort((a, b) => (a.paymentDate < b.paymentDate ? 1 : -1))[0];
+                   return (
+                     <tr
+                       key={cust.id}
+@@ -566,6 +619,26 @@ export default function CustomersTab({
+                           {cust.status}
+                         </span>
+                       </td>
++                      {/* Next Due Date */}
++                      <td className="px-6 py-4 text-xs text-slate-300 font-mono whitespace-nowrap">
++                        {cust.nextDueDate}
++                      </td>
++                      {/* Billing Status */}
++                      <td className="px-6 py-4">
++                        <BillingStatusBadge status={cust.billingStatus} />
++                      </td>
++                      {/* Outstanding Balance */}
++                      <td className="px-6 py-4 text-xs font-mono whitespace-nowrap">
++                        {outstandingBalance > 0 ? (
++                          <span className="text-red-400 font-semibold">₱{outstandingBalance.toFixed(2)}</span>
++                        ) : (
++                          <span className="text-slate-500">₱0.00</span>
++                        )}
++                      </td>
++                      {/* Last Payment */}
++                      <td className="px-6 py-4 text-xs text-slate-400 font-mono whitespace-nowrap">
++                        {lastPayment ? lastPayment.paymentDate : "—"}
++                      </td>
+                       {/* Action buttons */}
+                       <td className="px-6 py-4 text-right whitespace-nowrap">
+                         <div className="flex items-center justify-end gap-2">
+@@ -762,6 +835,42 @@ export default function CustomersTab({
+                     </div>
+                   </div>
+ 
++                  {/* Billing Schedule */}
++                  <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 space-y-3">
++                    <div className="text-xs font-bold text-slate-400 uppercase tracking-wide">
++                      Monthly Billing Schedule
++                    </div>
++                    <div className="grid grid-cols-2 gap-3">
++                      <div>
++                        <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide">
++                          Billing Start Date
++                        </label>
++                        <input
++                          type="date"
++                          value={editBillingStartDate}
++                          onChange={(e) => setEditBillingStartDate(e.target.value)}
++                          className="mt-1 w-full h-9 rounded-xl border border-slate-800 bg-slate-950 text-slate-100 px-2.5 text-xs outline-none focus:border-blue-500/60"
++                        />
++                      </div>
++                      <div>
++                        <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide">
++                          Due Day (1-31)
++                        </label>
++                        <input
++                          type="number"
++                          min={1}
++                          max={31}
++                          value={editDueDay}
++                          onChange={(e) => setEditDueDay(e.target.value)}
++                          className="mt-1 w-full h-9 rounded-xl border border-slate-800 bg-slate-950 text-slate-100 px-2.5 text-xs outline-none focus:border-blue-500/60 font-mono"
++                        />
++                      </div>
++                    </div>
++                    <p className="text-[10px] text-slate-500">
++                      Changing the billing start date re-derives the due day unless you also set an override above. Next due date and outstanding invoices are not retroactively changed.
++                    </p>
++                  </div>
++
+                   {/* Submit / Cancel Buttons */}
+                   <div className="flex items-center gap-2.5 pt-3 border-t border-slate-800">
+                     <button
+@@ -920,10 +1029,10 @@ export default function CustomersTab({
+                         <div>
+                           <div className="flex items-center gap-2">
+                             <span className="font-mono text-xs font-bold text-slate-200">
+-                              {inv.id}
++                              {inv.invoiceNumber}
+                             </span>
+                             <span className="text-xxs text-slate-500">
+-                              ({inv.billingPeriod})
++                              ({inv.billingPeriodStart} &rarr; {inv.billingPeriodEnd})
+                             </span>
+                           </div>
+                           <p className="text-xxs text-slate-400 mt-1">
+@@ -940,6 +1049,8 @@ export default function CustomersTab({
+                                 ? "bg-green-500/15 text-green-400"
+                                 : inv.status === "Overdue"
+                                 ? "bg-red-500/15 text-red-400"
++                                : inv.status === "Cancelled"
++                                ? "bg-slate-800 text-slate-400"
+                                 : "bg-yellow-500/15 text-yellow-400"
+                             }`}>
+                               {inv.status}
+@@ -1097,6 +1208,57 @@ export default function CustomersTab({
+                 </select>
+               </div>
+ 
++              {/* Billing schedule */}
++              <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3 space-y-3">
++                <div className="text-xs font-bold text-slate-400 uppercase tracking-wide">
++                  Monthly Billing Schedule
++                </div>
++                <div className="grid grid-cols-2 gap-3">
++                  <div>
++                    <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide">
++                      Installation Date
++                    </label>
++                    <input
++                      type="date"
++                      required
++                      value={newInstallationDate}
++                      onChange={(e) => setNewInstallationDate(e.target.value)}
++                      className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-900 text-slate-100 px-3 py-2 text-sm outline-none focus:border-blue-500/60"
++                    />
++                  </div>
++                  <div>
++                    <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide">
++                      Billing Start Date
++                    </label>
++                    <input
++                      type="date"
++                      placeholder={newInstallationDate}
++                      value={newBillingStartDate}
++                      onChange={(e) => setNewBillingStartDate(e.target.value)}
++                      className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-900 text-slate-100 px-3 py-2 text-sm outline-none focus:border-blue-500/60"
++                    />
++                    <p className="mt-1 text-[10px] text-slate-500">Defaults to installation date if left blank.</p>
++                  </div>
++                </div>
++                <div>
++                  <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wide">
++                    Due Day Override (1-31)
++                  </label>
++                  <input
++                    type="number"
++                    min={1}
++                    max={31}
++                    placeholder="Auto from billing start date"
++                    value={newDueDayOverride}
++                    onChange={(e) => setNewDueDayOverride(e.target.value)}
++                    className="mt-1 w-full rounded-xl border border-slate-800 bg-slate-900 text-slate-100 px-3 py-2 text-sm outline-none focus:border-blue-500/60 font-mono"
++                  />
++                  <p className="mt-1 text-[10px] text-slate-500">
++                    Leave blank to bill every month on the day-of-month of the billing start date.
++                  </p>
++                </div>
++              </div>
++
+               <div className="flex items-center gap-3 pt-3 border-t border-slate-800">
+                 <button
+                   type="button"
+diff --git a/src/components/DashboardTab.tsx b/src/components/DashboardTab.tsx
+index ec96f5b..7704a8e 100644
+--- a/src/components/DashboardTab.tsx
++++ b/src/components/DashboardTab.tsx
+@@ -11,12 +11,18 @@ import {
+   ShoppingBag,
+   Plus,
+   Zap,
+-  Clock
++  Clock,
++  CalendarClock,
++  CalendarDays,
++  AlertTriangle,
++  Wallet,
+ } from "lucide-react";
+ import { AppState, Customer, Invoice, Expense, RepairTask, ActivityLog } from "../types";
++import { BillingSummary } from "../hooks/useAppData";
+ 
+ interface DashboardTabProps {
+   state: AppState;
++  billingSummary?: BillingSummary | null;
+   onNavigateToTab: (tab: string) => void;
+   onOpenCustomer: (id: string) => void;
+   onOpenTask: (id: string) => void;
+@@ -24,6 +30,7 @@ interface DashboardTabProps {
+ 
+ export default function DashboardTab({
+   state,
++  billingSummary,
+   onNavigateToTab,
+   onOpenCustomer,
+   onOpenTask,
+@@ -102,7 +109,7 @@ export default function DashboardTab({
+     .reduce((sum, inv) => sum + inv.amount, 0);
+ 
+   const outstandingBalance = state.invoices
+-    .filter((inv) => inv.status === "Pending" || inv.status === "Overdue")
++    .filter((inv) => inv.status === "Unpaid" || inv.status === "Overdue")
+     .reduce((sum, inv) => sum + inv.amount, 0);
+ 
+   // Total expenses
+@@ -153,6 +160,24 @@ export default function DashboardTab({
+       ? (totalPaidRevenue / (totalPaidRevenue + outstandingBalance)) * 100
+       : 0;
+ 
++  // Recurring billing snapshot: prefer the server-computed summary (exact,
++  // SQL-aggregated), but fall back to a client-side estimate from already-
++  // loaded state so the cards aren't empty on first paint.
++  const weekFromNow = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
++  const fallbackBillingSummary: BillingSummary = {
++    dueToday: state.customers.filter((c) => c.status === "Active" && c.nextDueDate === todayStr).length,
++    dueThisWeek: state.customers.filter(
++      (c) => c.status === "Active" && c.nextDueDate >= todayStr && c.nextDueDate <= weekFromNow
++    ).length,
++    overdueCustomers: state.customers.filter((c) => c.billingStatus === "Overdue").length,
++    totalOutstandingBalance: outstandingBalance,
++    expectedMonthlyRevenue: state.customers
++      .filter((c) => c.status === "Active")
++      .reduce((sum, c) => sum + c.monthlyFee, 0),
++    collectedRevenueThisMonth: junePaidRevenue,
++  };
++  const billing = billingSummary || fallbackBillingSummary;
++
+   return (
+     <div className="space-y-8 animate-in fade-in duration-300">
+       {/* Welcome Title Banner */}
+@@ -325,6 +350,102 @@ export default function DashboardTab({
+         </div>
+       </div>
+ 
++      {/* Recurring Billing Snapshot */}
++      <div>
++        <h2 className="text-sm font-semibold text-slate-300 mb-3">Recurring Billing</h2>
++        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
++          <div
++            onClick={() => onNavigateToTab("customers")}
++            className="rounded-2xl border border-slate-800 bg-[#0c1222]/40 p-4 shadow-sm cursor-pointer hover:border-yellow-500/30 transition-colors"
++          >
++            <div className="flex items-center justify-between">
++              <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
++                Due Today
++              </span>
++              <CalendarClock className="h-4 w-4 text-yellow-400" />
++            </div>
++            <h3 className="text-lg font-semibold text-slate-100 mt-2">{billing.dueToday}</h3>
++            <p className="text-xxs text-slate-500 mt-1">Subscribers billed today</p>
++          </div>
++
++          <div
++            onClick={() => onNavigateToTab("customers")}
++            className="rounded-2xl border border-slate-800 bg-[#0c1222]/40 p-4 shadow-sm cursor-pointer hover:border-yellow-500/30 transition-colors"
++          >
++            <div className="flex items-center justify-between">
++              <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
++                Due This Week
++              </span>
++              <CalendarDays className="h-4 w-4 text-yellow-400" />
++            </div>
++            <h3 className="text-lg font-semibold text-slate-100 mt-2">{billing.dueThisWeek}</h3>
++            <p className="text-xxs text-slate-500 mt-1">Next 7 days</p>
++          </div>
++
++          <div
++            onClick={() => onNavigateToTab("customers")}
++            className="rounded-2xl border border-slate-800 bg-[#0c1222]/40 p-4 shadow-sm cursor-pointer hover:border-red-500/30 transition-colors"
++          >
++            <div className="flex items-center justify-between">
++              <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
++                Overdue Customers
++              </span>
++              <AlertTriangle className="h-4 w-4 text-red-400" />
++            </div>
++            <h3 className="text-lg font-semibold text-slate-100 mt-2">{billing.overdueCustomers}</h3>
++            <p className="text-xxs text-slate-500 mt-1">Past their due date</p>
++          </div>
++
++          <div
++            onClick={() => onNavigateToTab("billing")}
++            className="rounded-2xl border border-slate-800 bg-[#0c1222]/40 p-4 shadow-sm cursor-pointer hover:border-orange-500/30 transition-colors"
++          >
++            <div className="flex items-center justify-between">
++              <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
++                Outstanding Balance
++              </span>
++              <Wallet className="h-4 w-4 text-orange-400" />
++            </div>
++            <h3 className="text-lg font-semibold text-slate-100 mt-2">
++              ₱{billing.totalOutstandingBalance.toLocaleString("en-US", { minimumFractionDigits: 2 })}
++            </h3>
++            <p className="text-xxs text-slate-500 mt-1">Unpaid + overdue invoices</p>
++          </div>
++
++          <div
++            onClick={() => onNavigateToTab("billing")}
++            className="rounded-2xl border border-slate-800 bg-[#0c1222]/40 p-4 shadow-sm cursor-pointer hover:border-blue-500/30 transition-colors"
++          >
++            <div className="flex items-center justify-between">
++              <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
++                Expected Monthly Revenue
++              </span>
++              <TrendingUp className="h-4 w-4 text-blue-400" />
++            </div>
++            <h3 className="text-lg font-semibold text-slate-100 mt-2">
++              ₱{billing.expectedMonthlyRevenue.toLocaleString("en-US", { minimumFractionDigits: 2 })}
++            </h3>
++            <p className="text-xxs text-slate-500 mt-1">Sum of active subscriber fees</p>
++          </div>
++
++          <div
++            onClick={() => onNavigateToTab("billing")}
++            className="rounded-2xl border border-slate-800 bg-[#0c1222]/40 p-4 shadow-sm cursor-pointer hover:border-green-500/30 transition-colors"
++          >
++            <div className="flex items-center justify-between">
++              <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
++                Collected This Month
++              </span>
++              <DollarSign className="h-4 w-4 text-green-400" />
++            </div>
++            <h3 className="text-lg font-semibold text-slate-100 mt-2">
++              ₱{billing.collectedRevenueThisMonth.toLocaleString("en-US", { minimumFractionDigits: 2 })}
++            </h3>
++            <p className="text-xxs text-slate-500 mt-1">Payments received {currentMonthName}</p>
++          </div>
++        </div>
++      </div>
++
+       {/* Visual Charts section */}
+       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+         {/* Line Chart: Revenue Trend (4 Months back to now) */}
+@@ -526,7 +647,7 @@ export default function DashboardTab({
+                         {inv.customerName}
+                       </h4>
+                       <p className="text-xxs text-slate-400 mt-0.5">
+-                        {inv.id} • {inv.paymentMethod}
++                        {inv.invoiceNumber} • {inv.paymentMethod}
+                       </p>
+                     </div>
+                   </div>
+@@ -535,7 +656,7 @@ export default function DashboardTab({
+                       +₱{inv.amount.toFixed(2)}
+                     </span>
+                     <p className="text-xxs text-slate-500 mt-0.5">
+-                      {inv.paidDate}
++                      {inv.paymentDate}
+                     </p>
+                   </div>
+                 </div>
+diff --git a/src/components/Header.tsx b/src/components/Header.tsx
+index 282c817..da7759d 100644
+--- a/src/components/Header.tsx
++++ b/src/components/Header.tsx
+@@ -68,11 +68,12 @@ export default function Header({
+     state.invoices.forEach((i) => {
+       if (
+         i.id.toLowerCase().includes(query) ||
++        i.invoiceNumber.toLowerCase().includes(query) ||
+         i.customerName.toLowerCase().includes(query)
+       ) {
+         results.push({
+           type: "Invoice",
+-          label: i.id,
++          label: i.invoiceNumber,
+           sub: `${i.customerName} • ₱${i.amount} • ${i.status}`,
+           id: i.id,
+         });
+diff --git a/src/components/ReportsTab.tsx b/src/components/ReportsTab.tsx
+index 09a2a98..3964ac7 100644
+--- a/src/components/ReportsTab.tsx
++++ b/src/components/ReportsTab.tsx
+@@ -50,7 +50,7 @@ export default function ReportsTab({ state }: ReportsTabProps) {
+ 
+   // Outstanding Receivables
+   const outstandingAmount = invoices
+-    .filter((i) => i.status === "Pending" || i.status === "Overdue")
++    .filter((i) => i.status === "Unpaid" || i.status === "Overdue")
+     .reduce((sum, i) => sum + i.amount, 0);
+ 
+   // Real expense-by-category breakdown for the Financial Flow Statements
+@@ -290,10 +290,10 @@ export default function ReportsTab({ state }: ReportsTabProps) {
+                     </div>
+                     <div className="divide-y divide-slate-800/60">
+                       {invoices
+-                        .filter((i) => i.status === "Pending" || i.status === "Overdue")
++                        .filter((i) => i.status === "Unpaid" || i.status === "Overdue")
+                         .map((inv) => (
+                           <div key={inv.id} className="grid grid-cols-4 p-2.5 hover:bg-slate-900/20">
+-                            <span className="font-mono font-bold text-slate-400">{inv.id}</span>
++                            <span className="font-mono font-bold text-slate-400">{inv.invoiceNumber}</span>
+                             <span className="text-slate-300">{inv.customerName}</span>
+                             <span className="text-red-400 font-medium">{inv.dueDate}</span>
+                             <span className="text-right font-mono font-semibold text-slate-300">₱{inv.amount.toFixed(2)}</span>
+diff --git a/src/db/schema.ts b/src/db/schema.ts
+index a2c3135..ca6e4cb 100644
+--- a/src/db/schema.ts
++++ b/src/db/schema.ts
+@@ -3,9 +3,11 @@ import {
+   text,
+   timestamp,
+   serial,
++  integer,
+   numeric,
+   boolean,
+   pgEnum,
++  uniqueIndex,
+ } from "drizzle-orm/pg-core";
+ import { relations } from "drizzle-orm";
+ 
+@@ -19,12 +21,22 @@ export const customerStatusEnum = pgEnum("customer_status", [
+   "Disconnected",
+ ]);
+ export const planStatusEnum = pgEnum("plan_status", ["Active", "Inactive"]);
++// "Unpaid" replaces the old "Pending" label to match standard invoicing
++// terminology. Distinct from billing_status below, which is a customer-level
++// rollup rather than a per-invoice status.
+ export const invoiceStatusEnum = pgEnum("invoice_status", [
++  "Unpaid",
+   "Paid",
+-  "Pending",
+   "Overdue",
+   "Cancelled",
+ ]);
++// Customer-level rollup of standing relative to their next due date -
++// shown as a colored badge throughout the app.
++export const billingStatusEnum = pgEnum("billing_status", [
++  "Current",
++  "Due Soon",
++  "Overdue",
++]);
+ export const paymentMethodEnum = pgEnum("payment_method", [
+   "Cash",
+   "Bank Transfer",
+@@ -109,6 +121,24 @@ export const customers = pgTable("customers", {
+   monthlyFee: numeric("monthly_fee", { precision: 10, scale: 2 }).notNull(),
+   status: customerStatusEnum("status").notNull().default("Active"),
+   username: text("username"),
++
++  // --- Recurring monthly billing schedule -----------------------------
++  // The date the customer's monthly billing cycle begins (usually the
++  // installation/activation date). The day-of-month of this date is the
++  // customer's recurring "due day" every month going forward.
++  billingStartDate: text("billing_start_date").notNull(),
++  // 1-31. Normally derived from billingStartDate, but stored explicitly so
++  // it can be overridden independently (e.g. an admin wants billing on the
++  // 1st regardless of when the customer was actually installed).
++  dueDay: integer("due_day").notNull(),
++  // The next date this customer owes a payment. Advances automatically
++  // (by one month, clamped to short months) every time their current
++  // invoice is marked Paid.
++  nextDueDate: text("next_due_date").notNull(),
++  // Rollup of standing relative to nextDueDate, recomputed by the billing
++  // scheduler/service rather than trusted from client input.
++  billingStatus: billingStatusEnum("billing_status").notNull().default("Current"),
++
+   createdAt: timestamp("created_at").defaultNow().notNull(),
+   updatedAt: timestamp("updated_at").defaultNow().notNull(),
+ });
+@@ -133,19 +163,55 @@ export const technicians = pgTable("technicians", {
+ // ---------------------------------------------------------------------------
+ // Invoices
+ // ---------------------------------------------------------------------------
+-export const invoices = pgTable("invoices", {
+-  id: text("id").primaryKey(), // e.g. INV-2026-0001
++export const invoices = pgTable(
++  "invoices",
++  {
++    id: text("id").primaryKey(), // internal id, e.g. INV-2026-9F3A2C
++    // Human-facing, sequential-per-year invoice number, e.g. INV-2026-0001.
++    // Kept separate from `id` so display numbering can stay sequential even
++    // though the primary key itself is a collision-safe random token.
++    invoiceNumber: text("invoice_number").notNull(),
++    customerId: text("customer_id")
++      .notNull()
++      .references(() => customers.id, { onDelete: "cascade" }),
++    billingPeriodStart: text("billing_period_start").notNull(),
++    billingPeriodEnd: text("billing_period_end").notNull(),
++    dueDate: text("due_date").notNull(),
++    amount: numeric("amount", { precision: 10, scale: 2 }).notNull(),
++    status: invoiceStatusEnum("status").notNull().default("Unpaid"),
++    paymentDate: text("payment_date"),
++    paymentMethod: paymentMethodEnum("payment_method"),
++    notes: text("notes").notNull().default(""),
++    createdAt: timestamp("created_at").defaultNow().notNull(),
++    updatedAt: timestamp("updated_at").defaultNow().notNull(),
++  },
++  (table) => ({
++    invoiceNumberUnique: uniqueIndex("invoices_invoice_number_unique").on(
++      table.invoiceNumber
++    ),
++  })
++);
++
++// ---------------------------------------------------------------------------
++// Payments
++// One row per payment actually received against an invoice. Never deleted
++// (see business rule: payment history must never be deleted) - invoices can
++// be cancelled, but a recorded payment stands as a permanent audit record.
++// ---------------------------------------------------------------------------
++export const payments = pgTable("payments", {
++  id: text("id").primaryKey(), // e.g. PAY-1001
++  invoiceId: text("invoice_id")
++    .notNull()
++    .references(() => invoices.id, { onDelete: "restrict" }),
+   customerId: text("customer_id")
+     .notNull()
+-    .references(() => customers.id, { onDelete: "cascade" }),
+-  billingPeriod: text("billing_period").notNull(),
+-  dueDate: text("due_date").notNull(),
++    .references(() => customers.id, { onDelete: "restrict" }),
++  paymentDate: text("payment_date").notNull(),
+   amount: numeric("amount", { precision: 10, scale: 2 }).notNull(),
+-  status: invoiceStatusEnum("status").notNull().default("Pending"),
+-  paidDate: text("paid_date"),
+-  paymentMethod: paymentMethodEnum("payment_method"),
++  paymentMethod: paymentMethodEnum("payment_method").notNull(),
++  referenceNumber: text("reference_number"),
++  notes: text("notes").notNull().default(""),
+   createdAt: timestamp("created_at").defaultNow().notNull(),
+-  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+ });
+ 
+ // ---------------------------------------------------------------------------
+@@ -272,6 +338,7 @@ export const customersRelations = relations(customers, ({ one, many }) => ({
+     references: [plans.id],
+   }),
+   invoices: many(invoices),
++  payments: many(payments),
+   tasks: many(repairTasks),
+   timelineEvents: many(customerTimelineEvents),
+ }));
+@@ -284,11 +351,23 @@ export const techniciansRelations = relations(technicians, ({ one, many }) => ({
+   tasks: many(repairTasks),
+ }));
+ 
+-export const invoicesRelations = relations(invoices, ({ one }) => ({
++export const invoicesRelations = relations(invoices, ({ one, many }) => ({
+   customer: one(customers, {
+     fields: [invoices.customerId],
+     references: [customers.id],
+   }),
++  payments: many(payments),
++}));
++
++export const paymentsRelations = relations(payments, ({ one }) => ({
++  invoice: one(invoices, {
++    fields: [payments.invoiceId],
++    references: [invoices.id],
++  }),
++  customer: one(customers, {
++    fields: [payments.customerId],
++    references: [customers.id],
++  }),
+ }));
+ 
+ export const repairTasksRelations = relations(repairTasks, ({ one }) => ({
+@@ -311,3 +390,12 @@ export const customerTimelineEventsRelations = relations(
+     }),
+   })
+ );
++
++// ---------------------------------------------------------------------------
++// Inferred row types - convenience re-exports so server modules (services,
++// routes) don't each need their own `typeof table.$inferSelect` boilerplate.
++// ---------------------------------------------------------------------------
++export type Customer = typeof customers.$inferSelect;
++export type Plan = typeof plans.$inferSelect;
++export type Invoice = typeof invoices.$inferSelect;
++export type Payment = typeof payments.$inferSelect;
+diff --git a/src/hooks/useAppData.ts b/src/hooks/useAppData.ts
+index b4d72c5..f87d135 100644
+--- a/src/hooks/useAppData.ts
++++ b/src/hooks/useAppData.ts
+@@ -6,6 +6,7 @@ import {
+   Customer,
+   InternetPlan,
+   Invoice,
++  Payment,
+   Expense,
+   Technician,
+   RepairTask,
+@@ -16,6 +17,15 @@ import {
+   CustomerTimelineEvent,
+ } from "../types";
+ 
++export interface BillingSummary {
++  dueToday: number;
++  dueThisWeek: number;
++  overdueCustomers: number;
++  totalOutstandingBalance: number;
++  expectedMonthlyRevenue: number;
++  collectedRevenueThisMonth: number;
++}
++
+ // --- Server row -> frontend type mappers ------------------------------
+ // Postgres NUMERIC columns come back as strings over the wire; the
+ // frontend types expect numbers, so we normalize here in one place.
+@@ -24,11 +34,14 @@ function mapPlan(row: any): InternetPlan {
+   return { ...row, monthlyPrice: Number(row.monthlyPrice) };
+ }
+ function mapCustomer(row: any): Customer {
+-  return { ...row, monthlyFee: Number(row.monthlyFee) };
++  return { ...row, monthlyFee: Number(row.monthlyFee), dueDay: Number(row.dueDay) };
+ }
+ function mapInvoice(row: any): Invoice {
+   return { ...row, amount: Number(row.amount) };
+ }
++function mapPayment(row: any): Payment {
++  return { ...row, amount: Number(row.amount) };
++}
+ function mapExpense(row: any): Expense {
+   return { ...row, amount: Number(row.amount) };
+ }
+@@ -83,6 +96,8 @@ export function useAppData() {
+   const [customers, setCustomers] = useState<Customer[]>([]);
+   const [plans, setPlans] = useState<InternetPlan[]>([]);
+   const [invoices, setInvoices] = useState<Invoice[]>([]);
++  const [payments, setPayments] = useState<Payment[]>([]);
++  const [billingSummary, setBillingSummary] = useState<BillingSummary | null>(null);
+   const [expenses, setExpenses] = useState<Expense[]>([]);
+   const [technicians, setTechnicians] = useState<Technician[]>([]);
+   const [tasks, setTasks] = useState<RepairTask[]>([]);
+@@ -114,18 +129,23 @@ export function useAppData() {
+       setNotifications(notifsRes.map(mapNotification));
+ 
+       if (isAdmin) {
+-        const [invoicesRes, expensesRes, activityRes, auditRes, timelineRes] = await Promise.all([
+-          api.get<any[]>("/invoices"),
+-          api.get<any[]>("/expenses"),
+-          api.get<any[]>("/logs/activity"),
+-          api.get<any[]>("/logs/audit"),
+-          api.get<any[]>("/timeline"),
+-        ]);
++        const [invoicesRes, expensesRes, activityRes, auditRes, timelineRes, paymentsRes, billingSummaryRes] =
++          await Promise.all([
++            api.get<any[]>("/invoices"),
++            api.get<any[]>("/expenses"),
++            api.get<any[]>("/logs/activity"),
++            api.get<any[]>("/logs/audit"),
++            api.get<any[]>("/timeline"),
++            api.get<any[]>("/payments"),
++            api.get<BillingSummary>("/reports/billing-summary"),
++          ]);
+         setInvoices(invoicesRes.map(mapInvoice));
+         setExpenses(expensesRes.map(mapExpense));
+         setActivityLogs(activityRes.map(mapActivityLog));
+         setAuditRecords(auditRes.map(mapAuditRecord));
+         setTimelines(timelineRes.map(mapTimelineEvent));
++        setPayments(paymentsRes.map(mapPayment));
++        setBillingSummary(billingSummaryRes);
+       }
+       setIsConnected(true);
+     } catch (err) {
+@@ -158,6 +178,7 @@ export function useAppData() {
+     customers,
+     plans,
+     invoices,
++    payments,
+     expenses,
+     technicians: isAdmin ? technicians : ownTechnician ? [ownTechnician] : [],
+     tasks,
+@@ -168,7 +189,12 @@ export function useAppData() {
+   };
+ 
+   // --- Customers -------------------------------------------------------
+-  const addCustomer = async (payload: Omit<Customer, "id">) => {
++  // nextDueDate and billingStatus are always computed server-side; billing
++  // start date/due day are optional overrides the form may supply.
++  const addCustomer = async (
++    payload: Omit<Customer, "id" | "nextDueDate" | "billingStatus" | "billingStartDate" | "dueDay"> &
++      Partial<Pick<Customer, "billingStartDate" | "dueDay">>
++  ) => {
+     const created = await api.post<any>("/customers", payload);
+     setCustomers((prev) => [...prev, mapCustomer(created)]);
+   };
+@@ -204,21 +230,52 @@ export function useAppData() {
+   };
+ 
+   // --- Invoices ----------------------------------------------------------
+-  const addInvoice = async (payload: Omit<Invoice, "id">) => {
++  const addInvoice = async (payload: Omit<Invoice, "id" | "invoiceNumber">) => {
+     const created = await api.post<any>("/invoices", payload);
+     setInvoices((prev) => [...prev, mapInvoice(created)]);
+   };
+   const recordPayment = async (
+     id: string,
+-    paymentMethod: NonNullable<Invoice["paymentMethod"]>
++    paymentMethod: NonNullable<Invoice["paymentMethod"]>,
++    details?: { paymentDate?: string; referenceNumber?: string; notes?: string }
+   ) => {
+-    const updated = await api.put<any>(`/invoices/${id}`, { status: "Paid", paymentMethod });
+-    setInvoices((prev) => prev.map((i) => (i.id === id ? mapInvoice(updated) : i)));
++    const result = await api.post<any>(`/invoices/${id}/pay`, {
++      paymentMethod,
++      ...details,
++    });
++    setInvoices((prev) => {
++      const withPaid = prev.map((i) => (i.id === id ? mapInvoice(result.invoice) : i));
++      // The payment flow also generates next month's invoice - splice it in
++      // if one was created, rather than waiting for a full refetch.
++      if (result.nextInvoice && !withPaid.some((i) => i.id === result.nextInvoice.id)) {
++        return [...withPaid, mapInvoice(result.nextInvoice)];
++      }
++      return withPaid;
++    });
++    if (result.customer) {
++      setCustomers((prev) =>
++        prev.map((c) => (c.id === result.customer.id ? mapCustomer(result.customer) : c))
++      );
++    }
++    // Refetch payments + billing summary rather than reconstruct the
++    // payment row client-side (the server is the source of truth for the
++    // generated payment id/timestamps).
++    const [paymentsRes, billingSummaryRes] = await Promise.all([
++      api.get<any[]>("/payments"),
++      api.get<BillingSummary>("/reports/billing-summary"),
++    ]);
++    setPayments(paymentsRes.map(mapPayment));
++    setBillingSummary(billingSummaryRes);
+   };
+   const cancelInvoice = async (id: string) => {
+     const updated = await api.put<any>(`/invoices/${id}`, { status: "Cancelled" });
+     setInvoices((prev) => prev.map((i) => (i.id === id ? mapInvoice(updated) : i)));
+   };
++  const generateMonthlyInvoices = async () => {
++    const result = await api.post<{ generated: number }>("/invoices/generate-monthly");
++    await refetchAll();
++    return result.generated;
++  };
+ 
+   // --- Expenses ------------------------------------------------------------
+   const addExpense = async (payload: Omit<Expense, "id" | "recordedBy">) => {
+@@ -287,6 +344,7 @@ export function useAppData() {
+     state,
+     isLoading,
+     isConnected,
++    billingSummary,
+     refetchAll,
+     addCustomer,
+     updateCustomer,
+@@ -298,6 +356,7 @@ export function useAppData() {
+     addInvoice,
+     recordPayment,
+     cancelInvoice,
++    generateMonthlyInvoices,
+     addExpense,
+     addTechnician,
+     updateTechnician,
+diff --git a/src/server/backfill-billing.ts b/src/server/backfill-billing.ts
+new file mode 100644
+index 0000000..8d608a4
+--- /dev/null
++++ b/src/server/backfill-billing.ts
+@@ -0,0 +1,185 @@
++/**
++ * One-time migration helper for EXISTING, already-populated databases.
++ *
++ * This project's only schema-migration mechanism is `drizzle-kit push`
++ * (there are no versioned migration files), which works great for
++ * greenfield/empty databases but cannot safely add the new NOT NULL
++ * billing columns (billing_start_date, due_day, next_due_date,
++ * billing_status on customers; invoice_number, billing_period_start/end on
++ * invoices) directly to tables that already have rows - there'd be nothing
++ * to fill those columns with.
++ *
++ * Run this ONCE, BEFORE `npm run db:push`, on any database that already has
++ * customers/invoices in it:
++ *
++ *   tsx src/server/backfill-billing.ts
++ *
++ * It is idempotent and safe to re-run: every step uses
++ * `ADD COLUMN IF NOT EXISTS` / only fills rows where the value is still
++ * null, so running it twice (or running it, then running db:push, then
++ * running it again) does not corrupt data.
++ *
++ * On a brand new, empty database you can skip this and just run
++ * `npm run db:push` directly - drizzle will create the NOT NULL columns
++ * with no rows to worry about.
++ */
++import "dotenv/config";
++import { createPool } from "../db/index.ts";
++import { deriveDueDay, computeBillingStatus } from "./utils/billing.ts";
++
++async function backfill() {
++  const pool = createPool();
++  const client = await pool.connect();
++
++  try {
++    console.log("Starting billing backfill...");
++
++    // --- customers: add columns as nullable first -----------------------
++    await client.query(`
++      ALTER TABLE customers
++        ADD COLUMN IF NOT EXISTS billing_start_date text,
++        ADD COLUMN IF NOT EXISTS due_day integer,
++        ADD COLUMN IF NOT EXISTS next_due_date text
++    `);
++    // billing_status enum + column (create enum type if missing)
++    await client.query(`
++      DO $$ BEGIN
++        CREATE TYPE billing_status AS ENUM ('Current', 'Due Soon', 'Overdue');
++      EXCEPTION WHEN duplicate_object THEN NULL; END $$;
++    `);
++    await client.query(`
++      ALTER TABLE customers
++        ADD COLUMN IF NOT EXISTS billing_status billing_status
++    `);
++
++    // --- invoices: add new columns as nullable ---------------------------
++    await client.query(`
++      ALTER TABLE invoices
++        ADD COLUMN IF NOT EXISTS invoice_number text,
++        ADD COLUMN IF NOT EXISTS billing_period_start text,
++        ADD COLUMN IF NOT EXISTS billing_period_end text,
++        ADD COLUMN IF NOT EXISTS payment_date text,
++        ADD COLUMN IF NOT EXISTS notes text NOT NULL DEFAULT ''
++    `);
++    // The old status enum used "Pending" - rename its label to "Unpaid" in
++    // place so existing rows keep their meaning under the new name.
++    await client.query(`
++      DO $$ BEGIN
++        ALTER TYPE invoice_status RENAME VALUE 'Pending' TO 'Unpaid';
++      EXCEPTION WHEN others THEN NULL; END $$;
++    `);
++    // Migrate the old single billing_period text column into
++    // billing_period_start/end if it still exists.
++    const oldColumnCheck = await client.query(`
++      SELECT column_name FROM information_schema.columns
++      WHERE table_name = 'invoices' AND column_name = 'billing_period'
++    `);
++    if (oldColumnCheck.rows.length > 0) {
++      await client.query(`
++        UPDATE invoices
++        SET billing_period_start = COALESCE(billing_period_start, due_date),
++            billing_period_end = COALESCE(billing_period_end, due_date)
++        WHERE billing_period_start IS NULL
++      `);
++    }
++    // paid_date -> payment_date (old column name), if present.
++    const oldPaidDateCheck = await client.query(`
++      SELECT column_name FROM information_schema.columns
++      WHERE table_name = 'invoices' AND column_name = 'paid_date'
++    `);
++    if (oldPaidDateCheck.rows.length > 0) {
++      await client.query(`
++        UPDATE invoices SET payment_date = paid_date WHERE payment_date IS NULL
++      `);
++    }
++
++    // --- Fill in per-row billing schedule for customers ------------------
++    const { rows: customerRows } = await client.query(
++      `SELECT id, installation_date FROM customers WHERE billing_start_date IS NULL OR due_day IS NULL OR next_due_date IS NULL OR billing_status IS NULL`
++    );
++    console.log(`Backfilling billing schedule for ${customerRows.length} customer(s)...`);
++    for (const row of customerRows) {
++      const billingStartDate = row.installation_date;
++      const dueDay = deriveDueDay(billingStartDate);
++      const nextDueDate = billingStartDate;
++      const billingStatus = computeBillingStatus(nextDueDate);
++      await client.query(
++        `UPDATE customers
++         SET billing_start_date = COALESCE(billing_start_date, $1),
++             due_day = COALESCE(due_day, $2),
++             next_due_date = COALESCE(next_due_date, $3),
++             billing_status = COALESCE(billing_status, $4)
++         WHERE id = $5`,
++        [billingStartDate, dueDay, nextDueDate, billingStatus, row.id]
++      );
++    }
++
++    // --- Fill in invoice_number + billing period for existing invoices ---
++    const { rows: invoiceRows } = await client.query(
++      `SELECT id, due_date FROM invoices WHERE invoice_number IS NULL ORDER BY created_at ASC`
++    );
++    console.log(`Backfilling invoice numbers for ${invoiceRows.length} invoice(s)...`);
++    const yearSeq = new Map<number, number>();
++    for (const row of invoiceRows) {
++      const year = new Date(row.due_date).getUTCFullYear();
++      const seq = (yearSeq.get(year) ?? 0) + 1;
++      yearSeq.set(year, seq);
++      const invoiceNumber = `INV-${year}-${String(seq).padStart(4, "0")}`;
++      await client.query(
++        `UPDATE invoices
++         SET invoice_number = $1,
++             billing_period_start = COALESCE(billing_period_start, due_date),
++             billing_period_end = COALESCE(billing_period_end, due_date)
++         WHERE id = $2`,
++        [invoiceNumber, row.id]
++      );
++    }
++
++    // --- Now that every row has a value, lock in the NOT NULL + unique
++    // constraints that the schema expects. ---------------------------------
++    await client.query(`ALTER TABLE customers ALTER COLUMN billing_start_date SET NOT NULL`);
++    await client.query(`ALTER TABLE customers ALTER COLUMN due_day SET NOT NULL`);
++    await client.query(`ALTER TABLE customers ALTER COLUMN next_due_date SET NOT NULL`);
++    await client.query(`ALTER TABLE customers ALTER COLUMN billing_status SET NOT NULL`);
++    await client.query(`ALTER TABLE customers ALTER COLUMN billing_status SET DEFAULT 'Current'`);
++
++    await client.query(`ALTER TABLE invoices ALTER COLUMN invoice_number SET NOT NULL`);
++    await client.query(`ALTER TABLE invoices ALTER COLUMN billing_period_start SET NOT NULL`);
++    await client.query(`ALTER TABLE invoices ALTER COLUMN billing_period_end SET NOT NULL`);
++    await client.query(`
++      DO $$ BEGIN
++        CREATE UNIQUE INDEX invoices_invoice_number_unique ON invoices (invoice_number);
++      EXCEPTION WHEN duplicate_table THEN NULL; END $$;
++    `);
++    await client.query(`ALTER TABLE invoices ALTER COLUMN status SET DEFAULT 'Unpaid'`);
++
++    // --- Payments table (new) --------------------------------------------
++    await client.query(`
++      CREATE TABLE IF NOT EXISTS payments (
++        id text PRIMARY KEY,
++        invoice_id text NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
++        customer_id text NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
++        payment_date text NOT NULL,
++        amount numeric(10, 2) NOT NULL,
++        payment_method payment_method NOT NULL,
++        reference_number text,
++        notes text NOT NULL DEFAULT '',
++        created_at timestamp NOT NULL DEFAULT now()
++      )
++    `);
++
++    // Drop the now-superseded old columns, if they still exist.
++    await client.query(`ALTER TABLE invoices DROP COLUMN IF EXISTS billing_period`);
++    await client.query(`ALTER TABLE invoices DROP COLUMN IF EXISTS paid_date`);
++
++    console.log("Billing backfill complete. You can now safely run `npm run db:push`.");
++  } finally {
++    client.release();
++    await pool.end();
++  }
++}
++
++backfill().catch((err) => {
++  console.error("Billing backfill failed:", err);
++  process.exit(1);
++});
+diff --git a/src/server/routes/customers.routes.ts b/src/server/routes/customers.routes.ts
+index ce4248e..0e06a62 100644
+--- a/src/server/routes/customers.routes.ts
++++ b/src/server/routes/customers.routes.ts
+@@ -8,6 +8,8 @@ import { customerCreateSchema, customerUpdateSchema } from "../validation/schema
+ import { asyncHandler, ApiError, notFound } from "../utils/asyncHandler.ts";
+ import { ids } from "../utils/ids.ts";
+ import { recordActivity, recordAudit } from "../utils/activity.ts";
++import { deriveDueDay, computeBillingStatus } from "../utils/billing.ts";
++import { generateFirstInvoiceForCustomer } from "../services/billing.service.ts";
+ 
+ const router = Router();
+ 
+@@ -45,6 +47,15 @@ router.post(
+     });
+     if (!plan) throw new ApiError(400, "Selected plan does not exist");
+ 
++    // Billing schedule: billingStartDate defaults to the installation date,
++    // and the recurring due day is derived from it unless explicitly
++    // overridden. The very first cycle's due date is the billing start
++    // date itself (see billing.service.ts for how subsequent cycles roll).
++    const billingStartDate = body.billingStartDate || body.installationDate;
++    const dueDay = body.dueDay ?? deriveDueDay(billingStartDate);
++    const nextDueDate = billingStartDate;
++    const billingStatus = computeBillingStatus(nextDueDate);
++
+     const [created] = await db
+       .insert(customers)
+       .values({
+@@ -58,9 +69,21 @@ router.post(
+         monthlyFee: String(body.monthlyFee ?? plan.monthlyPrice),
+         status: body.status,
+         username: body.username,
++        billingStartDate,
++        dueDay,
++        nextDueDate,
++        billingStatus,
+       })
+       .returning();
+ 
++    // Every Active customer should have a first invoice waiting for their
++    // opening billing cycle - generated here rather than left for the
++    // scheduler so the customer's billing tab isn't empty until the next
++    // daily tick.
++    if (created.status === "Active") {
++      await generateFirstInvoiceForCustomer(created);
++    }
++
+     await recordActivity(req.user!, "Created customer account", created.id);
+     await recordAudit(req.user!, "Created New Customer", "None", `ID: ${created.id}, Name: ${created.fullName}`);
+ 
+@@ -88,13 +111,32 @@ router.put(
+       monthlyFee = String(plan.monthlyPrice);
+     }
+ 
++    // If the billing start date is being changed, re-derive the due day
++    // unless the caller explicitly supplied one in the same request.
++    let dueDay: number | undefined = body.dueDay;
++    if (body.billingStartDate && dueDay === undefined) {
++      dueDay = deriveDueDay(body.billingStartDate);
++    }
++
+     const { monthlyFee: _omit, ...rest } = body;
+     const [updated] = await db
+       .update(customers)
+-      .set({ ...rest, ...(monthlyFee ? { monthlyFee } : {}), updatedAt: new Date() })
++      .set({
++        ...rest,
++        ...(monthlyFee ? { monthlyFee } : {}),
++        ...(dueDay !== undefined ? { dueDay } : {}),
++        updatedAt: new Date(),
++      })
+       .where(eq(customers.id, req.params.id))
+       .returning();
+ 
++    // Reactivating a customer (Suspended/Disconnected -> Active) should
++    // make sure they have an invoice waiting for their current cycle,
++    // same as a brand new customer.
++    if (body.status === "Active" && existing.status !== "Active") {
++      await generateFirstInvoiceForCustomer(updated);
++    }
++
+     await recordActivity(req.user!, "Modified customer record", req.params.id);
+     const changes: string[] = [];
+     if (body.status && body.status !== existing.status) {
+@@ -103,6 +145,9 @@ router.put(
+     if (body.currentPlanId && body.currentPlanId !== existing.currentPlanId) {
+       changes.push(`Plan changed to ${body.currentPlanId}`);
+     }
++    if (body.billingStartDate && body.billingStartDate !== existing.billingStartDate) {
++      changes.push(`Billing start date changed to ${body.billingStartDate}`);
++    }
+     if (changes.length > 0) {
+       await recordAudit(req.user!, "Modified Subscriber Account", `Customer: ${req.params.id}`, changes.join(", "));
+     }
+diff --git a/src/server/routes/invoices.routes.ts b/src/server/routes/invoices.routes.ts
+index 5b6dbd5..0aa9fba 100644
+--- a/src/server/routes/invoices.routes.ts
++++ b/src/server/routes/invoices.routes.ts
+@@ -2,12 +2,21 @@ import { Router } from "express";
+ import { eq } from "drizzle-orm";
+ import { db } from "../../db/index.ts";
+ import { invoices, customers } from "../../db/schema.ts";
+-import { requireAuth, requireAdmin } from "../middleware/auth.ts";
++import { requireAdmin } from "../middleware/auth.ts";
+ import { validateBody } from "../middleware/validate.ts";
+-import { invoiceCreateSchema, invoiceUpdateSchema } from "../validation/schemas.ts";
++import {
++  invoiceCreateSchema,
++  invoiceUpdateSchema,
++  invoicePaymentSchema,
++} from "../validation/schemas.ts";
+ import { asyncHandler, ApiError, notFound } from "../utils/asyncHandler.ts";
+ import { ids } from "../utils/ids.ts";
+ import { recordActivity } from "../utils/activity.ts";
++import {
++  recordInvoicePayment,
++  generateMonthlyInvoicesForActiveCustomers,
++  generateInvoiceNumber,
++} from "../services/billing.service.ts";
+ 
+ const router = Router();
+ 
+@@ -20,14 +29,17 @@ router.get(
+     const rows = await db
+       .select({
+         id: invoices.id,
++        invoiceNumber: invoices.invoiceNumber,
+         customerId: invoices.customerId,
+         customerName: customers.fullName,
+-        billingPeriod: invoices.billingPeriod,
++        billingPeriodStart: invoices.billingPeriodStart,
++        billingPeriodEnd: invoices.billingPeriodEnd,
+         dueDate: invoices.dueDate,
+         amount: invoices.amount,
+         status: invoices.status,
+-        paidDate: invoices.paidDate,
++        paymentDate: invoices.paymentDate,
+         paymentMethod: invoices.paymentMethod,
++        notes: invoices.notes,
+       })
+       .from(invoices)
+       .leftJoin(customers, eq(invoices.customerId, customers.id));
+@@ -45,6 +57,22 @@ router.get(
+   })
+ );
+ 
++// Manually triggers the same monthly-generation logic the scheduler runs
++// automatically - useful for an admin who doesn't want to wait for the
++// next daily tick (e.g. right after seeding data, or in a demo).
++router.post(
++  "/generate-monthly",
++  requireAdmin,
++  asyncHandler(async (req, res) => {
++    const generated = await generateMonthlyInvoicesForActiveCustomers();
++    await recordActivity(req.user!, "Manually triggered monthly invoice generation", `${generated} invoice(s)`);
++    res.json({ generated });
++  })
++);
++
++// Ad-hoc invoice creation (e.g. a one-off charge). Recurring monthly
++// invoices are generated automatically by the billing service - this
++// endpoint is for exceptions, not the normal monthly cadence.
+ router.post(
+   "/",
+   requireAdmin,
+@@ -56,19 +84,44 @@ router.post(
+       .where(eq(customers.id, req.body.customerId));
+     if (!customer) throw new ApiError(400, "Customer does not exist");
+ 
++    const year = new Date(req.body.dueDate).getUTCFullYear();
++    const invoiceNumber = await generateInvoiceNumber(year);
++
+     const [created] = await db
+       .insert(invoices)
+       .values({
+         id: ids.invoice(),
++        invoiceNumber,
+         ...req.body,
+         amount: String(req.body.amount),
+       })
+       .returning();
+-    await recordActivity(req.user!, "Generated monthly invoice", created.id);
++    await recordActivity(req.user!, "Generated manual invoice", created.id);
+     res.status(201).json(created);
+   })
+ );
+ 
++// The full "record a payment" flow: marks the invoice Paid, writes a
++// permanent payment record, advances the customer's next due date, and
++// generates the next month's invoice. This is the only supported way to
++// mark an invoice Paid (see the guard in PUT below) so the side effects
++// always happen together.
++router.post(
++  "/:id/pay",
++  requireAdmin,
++  validateBody(invoicePaymentSchema),
++  asyncHandler(async (req, res) => {
++    try {
++      const result = await recordInvoicePayment(req.params.id, req.body);
++      await recordActivity(req.user!, "Recorded subscriber payment", req.params.id);
++      res.json(result);
++    } catch (err: any) {
++      if (err?.status) throw new ApiError(err.status, err.message);
++      throw err;
++    }
++  })
++);
++
+ router.put(
+   "/:id",
+   requireAdmin,
+@@ -77,25 +130,24 @@ router.put(
+     const [existing] = await db.select().from(invoices).where(eq(invoices.id, req.params.id));
+     if (!existing) throw notFound("Invoice");
+ 
++    // Marking Paid has side effects (payment record, next due date, next
++    // invoice) that only /pay performs correctly - block it here so the
++    // two code paths can't drift out of sync.
++    if (req.body.status === "Paid" && existing.status !== "Paid") {
++      throw new ApiError(400, "Use POST /invoices/:id/pay to record a payment");
++    }
++
+     const body = { ...req.body };
+     if (body.amount !== undefined) {
+       body.amount = String(body.amount) as unknown as number;
+     }
+-    // Marking an invoice Paid should stamp a paidDate if the client didn't send one.
+-    if (body.status === "Paid" && !body.paidDate) {
+-      body.paidDate = new Date().toISOString().slice(0, 10);
+-    }
+ 
+     const [updated] = await db
+       .update(invoices)
+       .set({ ...body, updatedAt: new Date() })
+       .where(eq(invoices.id, req.params.id))
+       .returning();
+-    await recordActivity(
+-      req.user!,
+-      body.status === "Paid" ? "Recorded subscriber payment" : "Updated billing invoice",
+-      req.params.id
+-    );
++    await recordActivity(req.user!, "Updated billing invoice", req.params.id);
+     res.json(updated);
+   })
+ );
+diff --git a/src/server/routes/payments.routes.ts b/src/server/routes/payments.routes.ts
+new file mode 100644
+index 0000000..e4874cb
+--- /dev/null
++++ b/src/server/routes/payments.routes.ts
+@@ -0,0 +1,44 @@
++import { Router } from "express";
++import { eq, desc } from "drizzle-orm";
++import { db } from "../../db/index.ts";
++import { payments, customers } from "../../db/schema.ts";
++import { requireAdmin } from "../middleware/auth.ts";
++import { asyncHandler } from "../utils/asyncHandler.ts";
++
++const router = Router();
++
++// Payment history is permanent and admin-visible only, same as invoices.
++// Payments are never created/edited/deleted directly through this router -
++// they're only ever written as a side effect of POST /invoices/:id/pay
++// (see billing.service.ts#recordInvoicePayment), which keeps the audit
++// trail consistent with the invoice + customer schedule it produced.
++router.get(
++  "/",
++  requireAdmin,
++  asyncHandler(async (req, res) => {
++    const customerId = typeof req.query.customerId === "string" ? req.query.customerId : undefined;
++    const baseQuery = db
++      .select({
++        id: payments.id,
++        invoiceId: payments.invoiceId,
++        customerId: payments.customerId,
++        customerName: customers.fullName,
++        paymentDate: payments.paymentDate,
++        amount: payments.amount,
++        paymentMethod: payments.paymentMethod,
++        referenceNumber: payments.referenceNumber,
++        notes: payments.notes,
++        createdAt: payments.createdAt,
++      })
++      .from(payments)
++      .leftJoin(customers, eq(payments.customerId, customers.id));
++
++    const rows = customerId
++      ? await baseQuery.where(eq(payments.customerId, customerId)).orderBy(desc(payments.paymentDate))
++      : await baseQuery.orderBy(desc(payments.paymentDate));
++
++    res.json(rows);
++  })
++);
++
++export default router;
+diff --git a/src/server/routes/reports.routes.ts b/src/server/routes/reports.routes.ts
+index 6538f43..f14551a 100644
+--- a/src/server/routes/reports.routes.ts
++++ b/src/server/routes/reports.routes.ts
+@@ -1,9 +1,10 @@
+ import { Router } from "express";
+-import { sql, eq } from "drizzle-orm";
++import { sql, eq, and } from "drizzle-orm";
+ import { db } from "../../db/index.ts";
+ import { invoices, expenses, customers, repairTasks } from "../../db/schema.ts";
+ import { requireAdmin } from "../middleware/auth.ts";
+ import { asyncHandler } from "../utils/asyncHandler.ts";
++import { todayStr } from "../utils/billing.ts";
+ 
+ const router = Router();
+ 
+@@ -20,7 +21,7 @@ router.get(
+     const [pending] = await db
+       .select({ total: sql<string>`coalesce(sum(${invoices.amount}), 0)` })
+       .from(invoices)
+-      .where(eq(invoices.status, "Pending"));
++      .where(eq(invoices.status, "Unpaid"));
+ 
+     const [overdue] = await db
+       .select({ total: sql<string>`coalesce(sum(${invoices.amount}), 0)` })
+@@ -53,4 +54,67 @@ router.get(
+   })
+ );
+ 
++// Dedicated billing dashboard metrics: due today/this week, overdue
++// customers, outstanding balance, expected vs. collected monthly revenue.
++// Computed in SQL for the same reason as /summary above - real numbers,
++// not client-side guesses, and cheap even at thousands of customers.
++router.get(
++  "/billing-summary",
++  requireAdmin,
++  asyncHandler(async (_req, res) => {
++    const today = todayStr();
++    const weekFromNow = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
++      .toISOString()
++      .slice(0, 10);
++    const monthPrefix = today.slice(0, 7);
++
++    const [dueToday] = await db
++      .select({ count: sql<string>`count(*)` })
++      .from(customers)
++      .where(and(eq(customers.status, "Active"), eq(customers.nextDueDate, today)));
++
++    const [dueThisWeek] = await db
++      .select({ count: sql<string>`count(*)` })
++      .from(customers)
++      .where(
++        and(
++          eq(customers.status, "Active"),
++          sql`${customers.nextDueDate} >= ${today}`,
++          sql`${customers.nextDueDate} <= ${weekFromNow}`
++        )
++      );
++
++    const [overdueCustomers] = await db
++      .select({ count: sql<string>`count(*)` })
++      .from(customers)
++      .where(eq(customers.billingStatus, "Overdue"));
++
++    const [outstanding] = await db
++      .select({ total: sql<string>`coalesce(sum(${invoices.amount}), 0)` })
++      .from(invoices)
++      .where(sql`${invoices.status} in ('Unpaid', 'Overdue')`);
++
++    const [expectedMonthlyRevenue] = await db
++      .select({ total: sql<string>`coalesce(sum(${customers.monthlyFee}), 0)` })
++      .from(customers)
++      .where(eq(customers.status, "Active"));
++
++    const [collectedThisMonth] = await db
++      .select({ total: sql<string>`coalesce(sum(${invoices.amount}), 0)` })
++      .from(invoices)
++      .where(
++        and(eq(invoices.status, "Paid"), sql`${invoices.paymentDate} like ${monthPrefix + "%"}`)
++      );
++
++    res.json({
++      dueToday: Number(dueToday.count),
++      dueThisWeek: Number(dueThisWeek.count),
++      overdueCustomers: Number(overdueCustomers.count),
++      totalOutstandingBalance: Number(outstanding.total),
++      expectedMonthlyRevenue: Number(expectedMonthlyRevenue.total),
++      collectedRevenueThisMonth: Number(collectedThisMonth.total),
++    });
++  })
++);
++
+ export default router;
+diff --git a/src/server/seed.ts b/src/server/seed.ts
+index 54396b4..bd83a0e 100644
+--- a/src/server/seed.ts
++++ b/src/server/seed.ts
+@@ -12,6 +12,8 @@ import { db } from "../db/index.ts";
+ import { users, technicians, plans, customers, repairTasks } from "../db/schema.ts";
+ import { hashPassword } from "./auth/passwords.ts";
+ import { ids } from "./utils/ids.ts";
++import { deriveDueDay, computeBillingStatus } from "./utils/billing.ts";
++import { generateFirstInvoiceForCustomer } from "./services/billing.service.ts";
+ 
+ async function seed() {
+   console.log("Seeding database...");
+@@ -100,6 +102,11 @@ async function seed() {
+   // --- Sample customer + task, so the app isn't empty on first load ----
+   const customerRows = await db.select().from(customers);
+   if (customerRows.length === 0 && planId) {
++    const installationDate = new Date().toISOString().slice(0, 10);
++    const billingStartDate = installationDate;
++    const dueDay = deriveDueDay(billingStartDate);
++    const nextDueDate = billingStartDate;
++
+     const [customer] = await db
+       .insert(customers)
+       .values({
+@@ -108,13 +115,19 @@ async function seed() {
+         address: "123 Main St, Springfield",
+         contactNumber: "555-0192",
+         email: "john.doe@example.com",
+-        installationDate: new Date().toISOString().slice(0, 10),
++        installationDate,
+         currentPlanId: planId,
+         monthlyFee: "1699.00",
+         status: "Active",
++        billingStartDate,
++        dueDay,
++        nextDueDate,
++        billingStatus: computeBillingStatus(nextDueDate),
+       })
+       .returning();
+ 
++    await generateFirstInvoiceForCustomer(customer);
++
+     if (techId) {
+       await db.insert(repairTasks).values({
+         id: ids.task(),
+@@ -129,7 +142,7 @@ async function seed() {
+         status: "Assigned",
+       });
+     }
+-    console.log("Seeded a sample customer and repair task.");
++    console.log("Seeded a sample customer, first invoice, and repair task.");
+   }
+ 
+   console.log("Seeding complete.");
+diff --git a/src/server/services/billing.service.ts b/src/server/services/billing.service.ts
+new file mode 100644
+index 0000000..8540c17
+--- /dev/null
++++ b/src/server/services/billing.service.ts
+@@ -0,0 +1,238 @@
++/**
++ * Core business logic for the recurring monthly billing system. Routes stay
++ * thin (HTTP concerns only) and call into this module for anything that
++ * touches billing rules, so the logic exists in exactly one place.
++ */
++import { and, eq, lt, sql } from "drizzle-orm";
++import { db } from "../../db/index.ts";
++import { customers, invoices, payments, Customer, Invoice } from "../../db/schema.ts";
++import { ids } from "../utils/ids.ts";
++import {
++  computeBillingPeriod,
++  computeBillingStatus,
++  computeNextDueDate,
++  todayStr,
++} from "../utils/billing.ts";
++
++/**
++ * Sequential-per-year human invoice number, e.g. INV-2026-0001. Not
++ * perfectly race-free under heavy concurrent writes (a COUNT-then-insert
++ * has a tiny TOCTOU window), but collisions are guarded by a unique index
++ * on invoice_number, and monthly-cadence invoice generation for a few
++ * thousand customers never approaches the concurrency where that matters.
++ */
++export async function generateInvoiceNumber(year: number): Promise<string> {
++  const prefix = `INV-${year}-`;
++  const [{ count }] = await db
++    .select({ count: sql<string>`count(*)` })
++    .from(invoices)
++    .where(sql`${invoices.invoiceNumber} like ${prefix + "%"}`);
++  const seq = Number(count) + 1;
++  return `${prefix}${String(seq).padStart(4, "0")}`;
++}
++
++/**
++ * Creates one invoice for a customer's given due-date cycle, unless one
++ * already exists for that exact due date (idempotent - safe to call
++ * repeatedly from the scheduler without double-billing).
++ */
++export async function createInvoiceForCycle(
++  customer: Customer,
++  dueDate: string,
++  isFirstInvoice: boolean
++): Promise<Invoice | null> {
++  const [existing] = await db
++    .select({ id: invoices.id })
++    .from(invoices)
++    .where(and(eq(invoices.customerId, customer.id), eq(invoices.dueDate, dueDate)));
++  if (existing) return null;
++
++  const { billingPeriodStart, billingPeriodEnd } = computeBillingPeriod(
++    dueDate,
++    customer.dueDay,
++    isFirstInvoice,
++    customer.billingStartDate
++  );
++  const year = new Date(dueDate).getUTCFullYear();
++  const invoiceNumber = await generateInvoiceNumber(year);
++
++  const [created] = await db
++    .insert(invoices)
++    .values({
++      id: ids.invoice(),
++      invoiceNumber,
++      customerId: customer.id,
++      billingPeriodStart,
++      billingPeriodEnd,
++      dueDate,
++      amount: customer.monthlyFee,
++      status: "Unpaid",
++    })
++    .returning();
++  return created;
++}
++
++/**
++ * Generates the first invoice for a brand-new Active customer, for their
++ * billing start date cycle. Called right after customer creation.
++ */
++export async function generateFirstInvoiceForCustomer(customer: Customer) {
++  if (customer.status !== "Active") return null;
++  return createInvoiceForCycle(customer, customer.nextDueDate, true);
++}
++
++/**
++ * Generates the next month's invoice for every Active customer whose
++ * current billing cycle doesn't have an invoice yet. Only fires for
++ * customers due today or already past due, so this can safely be re-run on
++ * every scheduler tick without generating invoices far in advance.
++ *
++ * Suspended/Disconnected customers are skipped entirely (business rule:
++ * only Active customers receive new invoices).
++ */
++export async function generateMonthlyInvoicesForActiveCustomers(): Promise<number> {
++  const today = todayStr();
++  const activeCustomers = await db
++    .select()
++    .from(customers)
++    .where(and(eq(customers.status, "Active"), sql`${customers.nextDueDate} <= ${today}`));
++
++  let generated = 0;
++  for (const customer of activeCustomers) {
++    const created = await createInvoiceForCycle(customer, customer.nextDueDate, false);
++    if (created) generated += 1;
++  }
++  return generated;
++}
++
++/** Marks any Unpaid invoice past its due date as Overdue. */
++export async function markOverdueInvoices(): Promise<number> {
++  const today = todayStr();
++  const overdue = await db
++    .update(invoices)
++    .set({ status: "Overdue", updatedAt: new Date() })
++    .where(and(eq(invoices.status, "Unpaid"), lt(invoices.dueDate, today)))
++    .returning({ id: invoices.id });
++  return overdue.length;
++}
++
++/** Recomputes every Active customer's billing_status from their nextDueDate. */
++export async function recalculateAllBillingStatuses(): Promise<void> {
++  const today = todayStr();
++  const allCustomers = await db.select().from(customers);
++  for (const customer of allCustomers) {
++    const status = computeBillingStatus(customer.nextDueDate, today);
++    if (status !== customer.billingStatus) {
++      await db
++        .update(customers)
++        .set({ billingStatus: status, updatedAt: new Date() })
++        .where(eq(customers.id, customer.id));
++    }
++  }
++}
++
++/**
++ * The full recurring billing tick: mark overdue invoices, refresh every
++ * customer's billing status, then top up missing invoices for anyone whose
++ * cycle has arrived. Idempotent - safe to run on a timer or on demand.
++ */
++export async function runBillingCycle(): Promise<{
++  overdueMarked: number;
++  invoicesGenerated: number;
++}> {
++  const overdueMarked = await markOverdueInvoices();
++  await recalculateAllBillingStatuses();
++  const invoicesGenerated = await generateMonthlyInvoicesForActiveCustomers();
++  // Overdue invoices can flip a customer's status; recompute once more so
++  // the dashboard/customer table reflect it within the same tick.
++  await recalculateAllBillingStatuses();
++  return { overdueMarked, invoicesGenerated };
++}
++
++export interface RecordPaymentInput {
++  paymentMethod: "Cash" | "Bank Transfer" | "Credit Card" | "Mobile Wallet" | "Other";
++  paymentDate?: string;
++  amount?: number;
++  referenceNumber?: string;
++  notes?: string;
++}
++
++/**
++ * The full payment flow described in the spec:
++ *  1. Load the invoice, guard against double-payment/cancelled invoices.
++ *  2. Mark it Paid and stamp payment details.
++ *  3. Insert a permanent payment record (never deleted).
++ *  4. Advance the customer's next due date.
++ *  5. Generate next month's invoice for the new cycle.
++ */
++export async function recordInvoicePayment(
++  invoiceId: string,
++  input: RecordPaymentInput
++): Promise<{ invoice: Invoice; nextInvoice: Invoice | null; customer: Customer }> {
++  const [invoice] = await db.select().from(invoices).where(eq(invoices.id, invoiceId));
++  if (!invoice) {
++    throw Object.assign(new Error("Invoice not found"), { status: 404 });
++  }
++  if (invoice.status === "Paid") {
++    throw Object.assign(new Error("Invoice is already paid"), { status: 409 });
++  }
++  if (invoice.status === "Cancelled") {
++    throw Object.assign(new Error("Cannot pay a cancelled invoice"), { status: 409 });
++  }
++
++  const paymentDate = input.paymentDate || todayStr();
++  const amount = input.amount ?? Number(invoice.amount);
++
++  const [updatedInvoice] = await db
++    .update(invoices)
++    .set({
++      status: "Paid",
++      paymentDate,
++      paymentMethod: input.paymentMethod,
++      notes: input.notes ?? invoice.notes,
++      updatedAt: new Date(),
++    })
++    .where(eq(invoices.id, invoiceId))
++    .returning();
++
++  await db.insert(payments).values({
++    id: ids.payment(),
++    invoiceId: invoice.id,
++    customerId: invoice.customerId,
++    paymentDate,
++    amount: String(amount),
++    paymentMethod: input.paymentMethod,
++    referenceNumber: input.referenceNumber,
++    notes: input.notes ?? "",
++  });
++
++  const [customer] = await db.select().from(customers).where(eq(customers.id, invoice.customerId));
++  let updatedCustomer = customer;
++  let nextInvoice: Invoice | null = null;
++
++  if (customer) {
++    const candidateNextDue = computeNextDueDate(invoice.dueDate, customer.dueDay);
++    // Only move the schedule forward - never backward - in case invoices
++    // were paid out of chronological order.
++    const shouldAdvance = candidateNextDue > customer.nextDueDate;
++    const newNextDueDate = shouldAdvance ? candidateNextDue : customer.nextDueDate;
++    const newBillingStatus = computeBillingStatus(newNextDueDate);
++
++    const [refreshedCustomer] = await db
++      .update(customers)
++      .set({
++        nextDueDate: newNextDueDate,
++        billingStatus: newBillingStatus,
++        updatedAt: new Date(),
++      })
++      .where(eq(customers.id, customer.id))
++      .returning();
++    updatedCustomer = refreshedCustomer;
++
++    if (customer.status === "Active") {
++      nextInvoice = await createInvoiceForCycle(updatedCustomer, newNextDueDate, false);
++    }
++  }
++
++  return { invoice: updatedInvoice, nextInvoice, customer: updatedCustomer };
++}
+diff --git a/src/server/utils/billing.ts b/src/server/utils/billing.ts
+new file mode 100644
+index 0000000..7531aff
+--- /dev/null
++++ b/src/server/utils/billing.ts
+@@ -0,0 +1,128 @@
++/**
++ * Pure date/business-rule helpers for the recurring monthly billing system.
++ * Kept dependency-free and side-effect-free so the same logic can be unit
++ * tested trivially and reused from routes, services, and the scheduler
++ * without duplicating date math anywhere.
++ *
++ * All dates in this module are plain "YYYY-MM-DD" strings (matching how the
++ * rest of the schema stores dates), and are treated as UTC calendar dates -
++ * there is no time-of-day component to a due date.
++ */
++
++/** Days in a given month (1-12), accounting for leap years. */
++function daysInMonth(year: number, month1to12: number): number {
++  // Day 0 of the *next* month is the last day of this month.
++  return new Date(Date.UTC(year, month1to12, 0)).getUTCDate();
++}
++
++function parseDate(dateStr: string): { year: number; month: number; day: number } {
++  const [year, month, day] = dateStr.split("-").map(Number);
++  return { year, month, day };
++}
++
++function formatDate(year: number, month1to12: number, day: number): string {
++  const mm = String(month1to12).padStart(2, "0");
++  const dd = String(day).padStart(2, "0");
++  return `${year}-${mm}-${dd}`;
++}
++
++/**
++ * Extracts the recurring due day (1-31) from a billing start date. This is
++ * the "day of month" component, used to derive every subsequent due date.
++ */
++export function deriveDueDay(billingStartDate: string): number {
++  return parseDate(billingStartDate).day;
++}
++
++/**
++ * Adds `months` calendar months to `dateStr`, then clamps the result to the
++ * target due day - rolling short months (e.g. Feb) to their last valid day
++ * instead of overflowing into the next month.
++ *
++ * Example: billed on the 31st -> Feb result clamps to Feb 28 (or 29).
++ * The following month then correctly rolls back to the 31st if that month
++ * has 31 days, because we always clamp against `dueDay`, not against
++ * whatever the previous (possibly-clamped) day happened to be.
++ */
++export function addMonthsClamped(
++  dateStr: string,
++  months: number,
++  dueDay: number
++): string {
++  const { year, month } = parseDate(dateStr);
++  const totalMonths = year * 12 + (month - 1) + months;
++  const newYear = Math.floor(totalMonths / 12);
++  const newMonth = (totalMonths % 12) + 1;
++  const clampedDay = Math.min(dueDay, daysInMonth(newYear, newMonth));
++  return formatDate(newYear, newMonth, clampedDay);
++}
++
++/**
++ * Computes the next due date after `fromDueDate`, respecting the customer's
++ * recurring due day and clamping for short months.
++ */
++export function computeNextDueDate(fromDueDate: string, dueDay: number): string {
++  return addMonthsClamped(fromDueDate, 1, dueDay);
++}
++
++/**
++ * The billing period a monthly invoice covers: the one calendar month
++ * ending the day before its due date (an ISP bill "for July" that becomes
++ * due August 1, say). For a customer's very first invoice, the period
++ * starts on their billing start date itself.
++ */
++export function computeBillingPeriod(
++  dueDate: string,
++  dueDay: number,
++  isFirstInvoice: boolean,
++  billingStartDate: string
++): { billingPeriodStart: string; billingPeriodEnd: string } {
++  if (isFirstInvoice) {
++    return { billingPeriodStart: billingStartDate, billingPeriodEnd: dueDate };
++  }
++  const { year, month } = parseDate(dueDate);
++  const totalMonths = year * 12 + (month - 1) - 1;
++  const prevYear = Math.floor(totalMonths / 12);
++  const prevMonth = (totalMonths % 12) + 1;
++  const clampedDay = Math.min(dueDay, daysInMonth(prevYear, prevMonth));
++  const billingPeriodStart = formatDate(prevYear, prevMonth, clampedDay);
++  return { billingPeriodStart, billingPeriodEnd: dueDate };
++}
++
++/** Whole days between two YYYY-MM-DD dates (b - a). Can be negative. */
++export function daysBetween(a: string, b: string): number {
++  const da = parseDate(a);
++  const db = parseDate(b);
++  const msPerDay = 24 * 60 * 60 * 1000;
++  const utcA = Date.UTC(da.year, da.month - 1, da.day);
++  const utcB = Date.UTC(db.year, db.month - 1, db.day);
++  return Math.round((utcB - utcA) / msPerDay);
++}
++
++export function todayStr(): string {
++  return new Date().toISOString().slice(0, 10);
++}
++
++/** Number of days out that counts as "Due Soon" (inclusive). */
++export const DUE_SOON_WINDOW_DAYS = 7;
++
++/**
++ * Rolls up a customer's billing standing from their nextDueDate:
++ *  - Overdue: next due date has already passed
++ *  - Due Soon: next due date is within DUE_SOON_WINDOW_DAYS
++ *  - Current: everything else
++ */
++export function computeBillingStatus(
++  nextDueDate: string,
++  today: string = todayStr()
++): "Current" | "Due Soon" | "Overdue" {
++  const diff = daysBetween(today, nextDueDate); // nextDueDate - today
++  if (diff < 0) return "Overdue";
++  if (diff <= DUE_SOON_WINDOW_DAYS) return "Due Soon";
++  return "Current";
++}
++
++/** Formats a Date/now as YYYY-MM-DD, used consistently for created invoices. */
++export function toDateOnly(date: Date): string {
++  return date.toISOString().slice(0, 10);
++}
+diff --git a/src/server/utils/ids.ts b/src/server/utils/ids.ts
+index c6ca7a6..5cfc05d 100644
+--- a/src/server/utils/ids.ts
++++ b/src/server/utils/ids.ts
+@@ -23,6 +23,7 @@ export const ids = {
+   customer: () => generateId("CUST"),
+   plan: () => generateId("PLAN"),
+   invoice: () => `INV-${new Date().getFullYear()}-${randomSuffix(6)}`,
++  payment: () => generateId("PAY"),
+   expense: () => generateId("EXP"),
+   technician: () => generateId("TECH"),
+   task: () => generateId("TASK"),
+diff --git a/src/server/utils/scheduler.ts b/src/server/utils/scheduler.ts
+new file mode 100644
+index 0000000..dbdba6b
+--- /dev/null
++++ b/src/server/utils/scheduler.ts
+@@ -0,0 +1,40 @@
++/**
++ * Minimal in-process scheduler for the recurring billing cycle. This
++ * codebase has no external cron/queue infrastructure, so "automatic every
++ * month" is implemented as an idempotent job (see
++ * services/billing.service.ts#runBillingCycle) that:
++ *   - marks overdue invoices
++ *   - recomputes every customer's billing status
++ *   - generates any invoices whose due-date cycle has arrived
++ *
++ * Running it once a day is more than enough cadence for monthly billing
++ * cycles, and running it again on server restart means a cycle is never
++ * missed just because the process happened to be down on the due date.
++ */
++import { runBillingCycle } from "../services/billing.service.ts";
++
++const ONE_DAY_MS = 24 * 60 * 60 * 1000;
++
++let started = false;
++
++export function startBillingScheduler() {
++  if (started) return;
++  started = true;
++
++  const tick = async () => {
++    try {
++      const { overdueMarked, invoicesGenerated } = await runBillingCycle();
++      if (overdueMarked || invoicesGenerated) {
++        console.log(
++          `[billing] cycle complete - ${overdueMarked} invoice(s) marked overdue, ${invoicesGenerated} invoice(s) generated.`
++        );
++      }
++    } catch (err) {
++      console.error("[billing] scheduled billing cycle failed:", err);
++    }
++  };
++
++  // Run once immediately on boot, then daily.
++  tick();
++  setInterval(tick, ONE_DAY_MS);
++}
+diff --git a/src/server/validation/schemas.ts b/src/server/validation/schemas.ts
+index 0ff3b9f..d9a9362 100644
+--- a/src/server/validation/schemas.ts
++++ b/src/server/validation/schemas.ts
+@@ -15,6 +15,11 @@ export const customerCreateSchema = z.object({
+   monthlyFee: z.number().positive().optional(),
+   status: z.enum(["Active", "Suspended", "Disconnected"]).default("Active"),
+   username: z.string().optional(),
++  // Billing schedule - billingStartDate defaults to installationDate and
++  // dueDay is derived from it server-side when omitted (see
++  // customers.routes.ts), so both are optional on input.
++  billingStartDate: z.string().optional(),
++  dueDay: z.number().int().min(1).max(31).optional(),
+ });
+ export const customerUpdateSchema = customerCreateSchema.partial();
+ 
+@@ -29,17 +34,27 @@ export const planUpdateSchema = planCreateSchema.partial();
+ 
+ export const invoiceCreateSchema = z.object({
+   customerId: z.string().min(1, "Customer is required"),
+-  billingPeriod: z.string().min(1, "Billing period is required"),
++  billingPeriodStart: z.string().min(1, "Billing period start is required"),
++  billingPeriodEnd: z.string().min(1, "Billing period end is required"),
+   dueDate: z.string().min(1, "Due date is required"),
+   amount: z.number().positive("Amount must be greater than 0"),
+-  status: z.enum(["Paid", "Pending", "Overdue", "Cancelled"]).default("Pending"),
+-  paidDate: z.string().optional(),
++  status: z.enum(["Unpaid", "Paid", "Overdue", "Cancelled"]).default("Unpaid"),
++  paymentDate: z.string().optional(),
+   paymentMethod: z
+     .enum(["Cash", "Bank Transfer", "Credit Card", "Mobile Wallet", "Other"])
+     .optional(),
++  notes: z.string().optional(),
+ });
+ export const invoiceUpdateSchema = invoiceCreateSchema.partial();
+ 
++export const invoicePaymentSchema = z.object({
++  paymentMethod: z.enum(["Cash", "Bank Transfer", "Credit Card", "Mobile Wallet", "Other"]),
++  paymentDate: z.string().optional(),
++  amount: z.number().positive().optional(),
++  referenceNumber: z.string().optional(),
++  notes: z.string().optional(),
++});
++
+ export const expenseCreateSchema = z.object({
+   date: z.string().min(1, "Date is required"),
+   category: z.string().min(1, "Category is required"),
+diff --git a/src/shells/AdminShell.tsx b/src/shells/AdminShell.tsx
+index a78bee2..1d52226 100644
+--- a/src/shells/AdminShell.tsx
++++ b/src/shells/AdminShell.tsx
+@@ -90,6 +90,7 @@ export default function AdminShell() {
+           {activeTab === "dashboard" && (
+             <DashboardTab
+               state={data.state}
++              billingSummary={data.billingSummary}
+               onNavigateToTab={setActiveTab}
+               onOpenCustomer={(id) => {
+                 setActiveTab("customers");
+@@ -130,6 +131,7 @@ export default function AdminShell() {
+               onAddInvoice={data.addInvoice}
+               onRecordPayment={data.recordPayment}
+               onCancelInvoice={data.cancelInvoice}
++              onGenerateMonthlyInvoices={data.generateMonthlyInvoices}
+             />
+           )}
+ 
+diff --git a/src/types.ts b/src/types.ts
+index 89e88c1..4650a4a 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -1,5 +1,7 @@
+ export type UserRole = "ADMIN" | "TECHNICIAN";
+ 
++export type BillingStatus = "Current" | "Due Soon" | "Overdue";
++
+ export interface Customer {
+   id: string; // e.g. CUST-1001
+   fullName: string;
+@@ -11,6 +13,11 @@ export interface Customer {
+   monthlyFee: number;
+   status: "Active" | "Suspended" | "Disconnected";
+   username?: string;
++  // --- Recurring monthly billing schedule ---
++  billingStartDate: string;
++  dueDay: number;
++  nextDueDate: string;
++  billingStatus: BillingStatus;
+ }
+ 
+ export interface CustomerTimelineEvent {
+@@ -32,15 +39,30 @@ export interface InternetPlan {
+ }
+ 
+ export interface Invoice {
+-  id: string; // e.g. INV-2026-0001
++  id: string; // internal id, e.g. INV-2026-9F3A2C
++  invoiceNumber: string; // e.g. INV-2026-0001
+   customerId: string;
+   customerName: string;
+-  billingPeriod: string; // e.g. "June 2026"
++  billingPeriodStart: string;
++  billingPeriodEnd: string;
+   dueDate: string;
+   amount: number;
+-  status: "Paid" | "Pending" | "Overdue" | "Cancelled";
+-  paidDate?: string;
++  status: "Unpaid" | "Paid" | "Overdue" | "Cancelled";
++  paymentDate?: string;
+   paymentMethod?: "Cash" | "Bank Transfer" | "Credit Card" | "Mobile Wallet" | "Other";
++  notes?: string;
++}
++
++export interface Payment {
++  id: string; // e.g. PAY-1001
++  invoiceId: string;
++  customerId: string;
++  customerName?: string;
++  paymentDate: string;
++  amount: number;
++  paymentMethod: "Cash" | "Bank Transfer" | "Credit Card" | "Mobile Wallet" | "Other";
++  referenceNumber?: string;
++  notes?: string;
+ }
+ 
+ export interface Expense {
+@@ -129,6 +151,7 @@ export interface AppState {
+   customers: Customer[];
+   plans: InternetPlan[];
+   invoices: Invoice[];
++  payments: Payment[];
+   expenses: Expense[];
+   technicians: Technician[];
+   tasks: RepairTask[];

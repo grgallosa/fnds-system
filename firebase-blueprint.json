@@ -1,0 +1,80 @@
+{
+  "entities": {
+    "AppState": {
+      "title": "AppState",
+      "description": "The complete operational state of the OptiFiber ISP Business Management suite.",
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": ["ADMIN", "TECHNICIAN"],
+          "description": "Current active access role for the local session."
+        },
+        "activeTechnicianId": {
+          "type": "string",
+          "description": "Technician ID currently viewing the technician assignments."
+        },
+        "customers": {
+          "type": "array",
+          "description": "Registered subscriber profiles."
+        },
+        "plans": {
+          "type": "array",
+          "description": "Broadband plans and tiers."
+        },
+        "invoices": {
+          "type": "array",
+          "description": "Subscribers invoices records."
+        },
+        "expenses": {
+          "type": "array",
+          "description": "Corporate operational expenditures."
+        },
+        "technicians": {
+          "type": "array",
+          "description": "Field engineer fleet roster."
+        },
+        "tasks": {
+          "type": "array",
+          "description": "Repair, maintenance and installation dispatches."
+        },
+        "timelines": {
+          "type": "array",
+          "description": "Subscriber interaction history log."
+        },
+        "activityLogs": {
+          "type": "array",
+          "description": "Audit trails of system changes."
+        },
+        "auditRecords": {
+          "type": "array",
+          "description": "Detailed attribute modification logs."
+        },
+        "notifications": {
+          "type": "array",
+          "description": "Active in-app notifications."
+        }
+      },
+      "required": [
+        "role",
+        "activeTechnicianId",
+        "customers",
+        "plans",
+        "invoices",
+        "expenses",
+        "technicians",
+        "tasks",
+        "timelines",
+        "activityLogs",
+        "auditRecords",
+        "notifications"
+      ]
+    }
+  },
+  "firestore": {
+    "states/optifiber": {
+      "schema": "AppState",
+      "description": "The centralized master state for OptiFiber operations synced in real-time."
+    }
+  }
+}
