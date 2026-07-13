@@ -53,7 +53,7 @@ interface CustomersTabProps {
   onAddCustomer: (
     customer: Omit<Customer, "id" | "nextDueDate" | "billingStatus" | "billingStartDate" | "dueDay"> &
       Partial<Pick<Customer, "billingStartDate" | "dueDay">>
-  ) => void;
+  ) => void | Promise<void>;
   onUpdateCustomer: (id: string, updates: Partial<Customer>) => void | Promise<void>;
   onAddTimelineEvent: (customerId: string, action: string, description: string) => void;
   onTriggerTaskForCustomer: (customer: Customer) => void;
@@ -263,32 +263,59 @@ export default function CustomersTab({
     document.body.removeChild(link);
   };
 
-  const handleImportSubmit = () => {
+  const [isImporting, setIsImporting] = useState(false);
+  const handleImportSubmit = async () => {
     const validRows = parsedRows.filter(r => r.errors.length === 0);
     if (validRows.length === 0) {
       alert("No valid rows to import.");
       return;
     }
 
-    validRows.forEach(row => {
-      onAddCustomer({
-        fullName: row.fullName,
-        address: row.address,
-        contactNumber: row.contactNumber,
-        email: row.email,
-        installationDate: new Date().toISOString().split("T")[0],
-        currentPlanId: row.currentPlanId,
-        monthlyFee: row.monthlyFee,
-        status: row.status,
-      });
-    });
+    setIsImporting(true);
+    setImportError("");
+    // Import sequentially (not Promise.all) and track each row's outcome -
+    // firing every request in parallel and unconditionally reporting
+    // successCount = validRows.length (as before) claimed success even when
+    // every request had failed (duplicate email, bad plan id, network error).
+    const results = await Promise.allSettled(
+      validRows.map(row =>
+        onAddCustomer({
+          fullName: row.fullName,
+          address: row.address,
+          contactNumber: row.contactNumber,
+          email: row.email,
+          installationDate: new Date().toISOString().split("T")[0],
+          currentPlanId: row.currentPlanId,
+          monthlyFee: row.monthlyFee,
+          status: row.status,
+        })
+      )
+    );
+    setIsImporting(false);
 
-    setSuccessCount(validRows.length);
+    const succeeded = results.filter(r => r.status === "fulfilled").length;
+    const failed = results.length - succeeded;
+
+    if (succeeded === 0) {
+      setImportError(
+        `Import failed for all ${failed} row(s). ${
+          (results.find(r => r.status === "rejected") as PromiseRejectedResult | undefined)?.reason?.message ||
+          "Please check the data and try again."
+        }`
+      );
+      return;
+    }
+
+    setSuccessCount(succeeded);
+    if (failed > 0) {
+      setImportError(`${failed} row(s) failed to import and were skipped.`);
+    }
     setTimeout(() => {
       setShowImportModal(false);
       setParsedRows([]);
       setSuccessCount(null);
-    }, 2000);
+      setImportError("");
+    }, failed > 0 ? 4000 : 2000);
   };
 
   // Sync selectedCustomerId from props if active
@@ -307,43 +334,54 @@ export default function CustomersTab({
     }
   };
 
-  const handleAddSubmit = (e: React.FormEvent) => {
+  const handleAddSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newFullName || !newAddress || !newPhone || !newEmail) {
       alert("Please fill in all fields.");
       return;
     }
 
-    onAddCustomer({
-      fullName: newFullName,
-      address: newAddress,
-      contactNumber: newPhone,
-      email: newEmail,
-      installationDate: newInstallationDate,
-      currentPlanId: newPlanId,
-      monthlyFee: Number(newFee),
-      status: newStatus,
-      username: newUsername || newEmail.split("@")[0] || newFullName.toLowerCase().replace(/\s+/g, "."),
-      billingStartDate: newBillingStartDate || undefined,
-      dueDay: newDueDayOverride ? Number(newDueDayOverride) : undefined,
-    });
+    try {
+      await onAddCustomer({
+        fullName: newFullName,
+        address: newAddress,
+        contactNumber: newPhone,
+        email: newEmail,
+        installationDate: newInstallationDate,
+        currentPlanId: newPlanId,
+        monthlyFee: Number(newFee),
+        status: newStatus,
+        username: newUsername || newEmail.split("@")[0] || newFullName.toLowerCase().replace(/\s+/g, "."),
+        billingStartDate: newBillingStartDate || undefined,
+        dueDay: newDueDayOverride ? Number(newDueDayOverride) : undefined,
+      });
 
-    // Reset Form
-    setNewFullName("");
-    setNewAddress("");
-    setNewPhone("");
-    setNewEmail("");
-    setNewUsername("");
-    setNewInstallationDate(new Date().toISOString().slice(0, 10));
-    setNewBillingStartDate("");
-    setNewDueDayOverride("");
-    setShowAddModal(false);
+      // Reset Form - only on success, so a failed request leaves the
+      // modal open with what the user typed instead of silently
+      // discarding it.
+      setNewFullName("");
+      setNewAddress("");
+      setNewPhone("");
+      setNewEmail("");
+      setNewUsername("");
+      setNewInstallationDate(new Date().toISOString().slice(0, 10));
+      setNewBillingStartDate("");
+      setNewDueDayOverride("");
+      setShowAddModal(false);
+    } catch (err: any) {
+      alert(err?.message || "Failed to create customer.");
+    }
   };
 
-  const handleStatusChange = (cust: Customer, newStatus: "Active" | "Suspended" | "Disconnected") => {
-    onUpdateCustomer(cust.id, { status: newStatus });
-    
-    // Log timeline
+  const handleStatusChange = async (cust: Customer, newStatus: "Active" | "Suspended" | "Disconnected") => {
+    try {
+      await onUpdateCustomer(cust.id, { status: newStatus });
+    } catch (err: any) {
+      alert(err?.message || "Failed to update customer status.");
+      return;
+    }
+
+    // Log timeline - only once the status change has actually persisted
     let action = "Customer Activated";
     let desc = `Customer account service has been re-activated by Administrator.`;
     if (newStatus === "Suspended") {
@@ -1106,8 +1144,8 @@ export default function CustomersTab({
       {/* Add Customer Modal */}
       {showAddModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
-          <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-[#0c111d] p-6 shadow-2xl animate-in zoom-in-95 duration-150">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+          <div className="w-full max-w-md max-h-[90vh] rounded-2xl border border-slate-800 bg-[#0c111d] p-6 shadow-2xl animate-in zoom-in-95 duration-150 flex flex-col">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3 shrink-0">
               <h2 className="text-lg font-bold text-slate-100">Add New Customer</h2>
               <button
                 onClick={() => setShowAddModal(false)}
@@ -1117,7 +1155,8 @@ export default function CustomersTab({
               </button>
             </div>
 
-            <form onSubmit={handleAddSubmit} className="mt-4 space-y-4">
+            <form onSubmit={handleAddSubmit} className="mt-4 flex flex-col flex-1 min-h-0">
+            <div className="space-y-4 overflow-y-auto pr-1 flex-1 min-h-0">
               {/* Full name */}
               <div>
                 <label className="block text-xs font-bold text-slate-400 uppercase tracking-wide">
@@ -1294,8 +1333,9 @@ export default function CustomersTab({
                   </p>
                 </div>
               </div>
+            </div>
 
-              <div className="flex items-center gap-3 pt-3 border-t border-slate-800">
+              <div className="flex items-center gap-3 pt-3 border-t border-slate-800 shrink-0">
                 <button
                   type="button"
                   onClick={() => setShowAddModal(false)}
@@ -1538,10 +1578,12 @@ export default function CustomersTab({
                     <button
                       type="button"
                       onClick={handleImportSubmit}
-                      disabled={parsedRows.filter(r => r.errors.length === 0).length === 0}
+                      disabled={isImporting || parsedRows.filter(r => r.errors.length === 0).length === 0}
                       className="rounded-xl bg-green-600 px-4 py-2 text-xs font-bold text-white hover:bg-green-500 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shadow-lg shadow-green-500/10"
                     >
-                      Import {parsedRows.filter(r => r.errors.length === 0).length} Valid Customers
+                      {isImporting
+                        ? "Importing..."
+                        : `Import ${parsedRows.filter(r => r.errors.length === 0).length} Valid Customers`}
                     </button>
                   )}
                 </div>

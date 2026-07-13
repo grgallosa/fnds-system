@@ -19,12 +19,12 @@ import { AppState, RepairTask, Customer, Technician, CompletionNotes } from "../
 
 interface TasksTabProps {
   state: AppState;
-  onAddTask: (task: Omit<RepairTask, "id" | "dateCreated">) => void;
-  onUpdateTaskStatus: (id: string, status: RepairTask["status"]) => void;
-  onAddTaskCompletion: (id: string, notes: CompletionNotes) => void;
-  onEditTask?: (id: string, updates: Partial<RepairTask>) => void;
-  onDeleteTask?: (id: string) => void;
-  onAddTaskNote?: (id: string, note: string) => void;
+  onAddTask: (task: Omit<RepairTask, "id" | "dateCreated">) => void | Promise<void>;
+  onUpdateTaskStatus: (id: string, status: RepairTask["status"]) => void | Promise<void>;
+  onAddTaskCompletion: (id: string, notes: CompletionNotes) => void | Promise<void>;
+  onEditTask?: (id: string, updates: Partial<RepairTask>) => void | Promise<void>;
+  onDeleteTask?: (id: string) => void | Promise<void>;
+  onAddTaskNote?: (id: string, note: string) => void | Promise<void>;
   selectedTaskId?: string;
   onCloseDetailView?: () => void;
 }
@@ -84,49 +84,57 @@ export default function TasksTab({
     }
   }, [selectedTaskId]);
 
-  const handleCreateSubmit = (e: React.FormEvent) => {
+  const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const cust = state.customers.find((c) => c.id === taskCustomerId);
     if (!cust) return;
 
-    onAddTask({
-      customerId: taskCustomerId,
-      customerName: cust.fullName,
-      assignedTechnicianId: taskTechId,
-      priority: taskPriority,
-      description: taskDesc,
-      address: cust.address,
-      scheduledDate: taskSchedDate,
-      estimatedDuration: taskDuration,
-      status: "Assigned",
-    });
+    try {
+      await onAddTask({
+        customerId: taskCustomerId,
+        customerName: cust.fullName,
+        assignedTechnicianId: taskTechId,
+        priority: taskPriority,
+        description: taskDesc,
+        address: cust.address,
+        scheduledDate: taskSchedDate,
+        estimatedDuration: taskDuration,
+        status: "Assigned",
+      });
 
-    setTaskDesc("");
-    setShowCreateModal(false);
+      setTaskDesc("");
+      setShowCreateModal(false);
+    } catch (err: any) {
+      alert(err?.message || "Failed to create task.");
+    }
   };
 
-  const handleCompletionSubmit = (e: React.FormEvent) => {
+  const handleCompletionSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!completingTaskId) return;
 
-    onAddTaskCompletion(completingTaskId, {
-      problemFound,
-      workPerformed,
-      materialsUsed,
-      additionalRecommendation: recommendation,
-      completionTime,
-      customerConfirmation: customerConfirmed,
-    });
+    try {
+      await onAddTaskCompletion(completingTaskId, {
+        problemFound,
+        workPerformed,
+        materialsUsed,
+        additionalRecommendation: recommendation,
+        completionTime,
+        customerConfirmation: customerConfirmed,
+      });
 
-    // Reset completion form
-    setProblemFound("");
-    setWorkPerformed("");
-    setMaterialsUsed("");
-    setRecommendation("");
-    setCompletionTime("");
-    setCustomerConfirmed(true);
-    setCompletingTaskId(null);
-    setShowCompleteModal(false);
+      // Reset completion form - only on success
+      setProblemFound("");
+      setWorkPerformed("");
+      setMaterialsUsed("");
+      setRecommendation("");
+      setCompletionTime("");
+      setCustomerConfirmed(true);
+      setCompletingTaskId(null);
+      setShowCompleteModal(false);
+    } catch (err: any) {
+      alert(err?.message || "Failed to submit completion notes.");
+    }
   };
 
   const openEditModal = (task: RepairTask) => {
@@ -138,25 +146,33 @@ export default function TasksTab({
     setShowEditModal(true);
   };
 
-  const handleEditSubmit = (e: React.FormEvent) => {
+  const handleEditSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeTaskId || !onEditTask) return;
-    onEditTask(activeTaskId, {
-      description: editDesc,
-      assignedTechnicianId: editTechId,
-      priority: editPriority,
-      scheduledDate: editSchedDate,
-      estimatedDuration: editDuration,
-    });
-    setShowEditModal(false);
+    try {
+      await onEditTask(activeTaskId, {
+        description: editDesc,
+        assignedTechnicianId: editTechId,
+        priority: editPriority,
+        scheduledDate: editSchedDate,
+        estimatedDuration: editDuration,
+      });
+      setShowEditModal(false);
+    } catch (err: any) {
+      alert(err?.message || "Failed to save task changes.");
+    }
   };
 
-  const handleDeleteTask = (id: string) => {
+  const handleDeleteTask = async (id: string) => {
     if (!onDeleteTask) return;
     if (confirm("Delete this repair task permanently? This cannot be undone.")) {
-      onDeleteTask(id);
-      setActiveTaskId(null);
-      if (onCloseDetailView) onCloseDetailView();
+      try {
+        await onDeleteTask(id);
+        setActiveTaskId(null);
+        if (onCloseDetailView) onCloseDetailView();
+      } catch (err: any) {
+        alert(err?.message || "Failed to delete task.");
+      }
     }
   };
 

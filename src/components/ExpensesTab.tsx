@@ -17,7 +17,7 @@ import { AppState, Expense } from "../types";
 
 interface ExpensesTabProps {
   state: AppState;
-  onAddExpense: (expense: Omit<Expense, "id" | "recordedBy">) => void;
+  onAddExpense: (expense: Omit<Expense, "id" | "recordedBy">) => void | Promise<void>;
 }
 
 const EXPENSE_CATEGORIES = [
@@ -87,30 +87,34 @@ export default function ExpensesTab({ state, onAddExpense }: ExpensesTabProps) {
     }
   };
 
-  const handleFormSubmit = (e: React.FormEvent) => {
+  const handleFormSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!amount || !vendor) {
       alert("Please fill in required fields.");
       return;
     }
 
-    onAddExpense({
-      date,
-      category,
-      amount: Number(amount),
-      vendor,
-      description,
-      receiptImage: receiptSim ? `${receiptSim.name} (${receiptSim.size})` : undefined,
-    });
+    try {
+      await onAddExpense({
+        date,
+        category,
+        amount: Number(amount),
+        vendor,
+        description,
+        receiptImage: receiptSim ? `${receiptSim.name} (${receiptSim.size})` : undefined,
+      });
 
-    // Reset fields
-    setDate(new Date().toISOString().split("T")[0]);
-    setCategory(EXPENSE_CATEGORIES[0]);
-    setAmount("");
-    setVendor("");
-    setDescription("");
-    setReceiptSim(null);
-    setShowAddModal(false);
+      // Reset fields - only on success
+      setDate(new Date().toISOString().split("T")[0]);
+      setCategory(EXPENSE_CATEGORIES[0]);
+      setAmount("");
+      setVendor("");
+      setDescription("");
+      setReceiptSim(null);
+      setShowAddModal(false);
+    } catch (err: any) {
+      alert(err?.message || "Failed to record expense.");
+    }
   };
 
   // Financial calculations

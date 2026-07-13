@@ -8,7 +8,7 @@ import { customerCreateSchema, customerUpdateSchema } from "../validation/schema
 import { asyncHandler, ApiError, notFound } from "../utils/asyncHandler.ts";
 import { ids } from "../utils/ids.ts";
 import { recordActivity, recordAudit } from "../utils/activity.ts";
-import { deriveDueDay, computeBillingStatus, todayStr } from "../utils/billing.ts";
+import { deriveDueDay, computeBillingStatus, todayStr, addMonthsClamped } from "../utils/billing.ts";
 import { generateFirstInvoiceForCustomer } from "../services/billing.service.ts";
 
 const router = Router();
@@ -124,6 +124,21 @@ router.put(
       dueDay = deriveDueDay(body.billingStartDate);
     }
 
+    // If the recurring due day is changing (directly, or as a side effect of
+    // a billing start date edit above), the customer's upcoming nextDueDate
+    // needs its day-of-month corrected to match - otherwise the edit only
+    // "sticks" inside the edit form (which reads billingStartDate/dueDay
+    // directly) while every other view (customer list, dashboard, billing
+    // tab) keeps showing the stale nextDueDate that was computed under the
+    // old due day. We only shift the day-of-month here, not the month/year,
+    // so we don't accidentally skip or repeat a billing cycle.
+    let nextDueDate: string | undefined;
+    let billingStatus: "Current" | "Due Soon" | "Overdue" | undefined;
+    if (dueDay !== undefined && dueDay !== existing.dueDay) {
+      nextDueDate = addMonthsClamped(existing.nextDueDate, 0, dueDay);
+      billingStatus = computeBillingStatus(nextDueDate);
+    }
+
     const { monthlyFee: _omit, ...rest } = body;
     const [updated] = await db
       .update(customers)
@@ -131,6 +146,7 @@ router.put(
         ...rest,
         ...(monthlyFee ? { monthlyFee } : {}),
         ...(dueDay !== undefined ? { dueDay } : {}),
+        ...(nextDueDate ? { nextDueDate, billingStatus } : {}),
         updatedAt: new Date(),
       })
       .where(eq(customers.id, req.params.id))

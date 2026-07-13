@@ -6,9 +6,9 @@ interface TechniciansTabProps {
   state: AppState;
   onAddTechnician: (
     tech: Omit<Technician, "id"> & { username?: string; password?: string }
-  ) => void;
-  onUpdateTechnicianStatus: (id: string, status: "Active" | "On Leave" | "Inactive") => void;
-  onUpdateTechnician?: (id: string, updates: Partial<Technician>) => void;
+  ) => void | Promise<void>;
+  onUpdateTechnicianStatus: (id: string, status: "Active" | "On Leave" | "Inactive") => void | Promise<void>;
+  onUpdateTechnician?: (id: string, updates: Partial<Technician>) => void | Promise<void>;
   onSetTechnicianCredentials?: (id: string, username: string, password: string) => Promise<void>;
 }
 
@@ -66,7 +66,7 @@ export default function TechniciansTab({
     }
   };
 
-  const handleEditSubmit = (e: React.FormEvent) => {
+  const handleEditSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingTechnician) return;
     if (!editName || !editPhone || !editEmail) {
@@ -74,51 +74,59 @@ export default function TechniciansTab({
       return;
     }
 
-    if (onUpdateTechnician) {
-      onUpdateTechnician(editingTechnician.id, {
-        name: editName,
-        phone: editPhone,
-        email: editEmail,
-        position: editPosition,
-        status: editStatus,
-      });
-    } else {
-      onUpdateTechnicianStatus(editingTechnician.id, editStatus);
-    }
+    try {
+      if (onUpdateTechnician) {
+        await onUpdateTechnician(editingTechnician.id, {
+          name: editName,
+          phone: editPhone,
+          email: editEmail,
+          position: editPosition,
+          status: editStatus,
+        });
+      } else {
+        await onUpdateTechnicianStatus(editingTechnician.id, editStatus);
+      }
 
-    setEditingTechnician(null);
+      setEditingTechnician(null);
+    } catch (err: any) {
+      alert(err?.message || "Failed to save technician changes.");
+    }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name || !phone || !email) {
       alert("Please fill in required fields.");
       return;
     }
 
-    onAddTechnician({
-      name,
-      phone,
-      email,
-      position,
-      status,
-      profilePicture: name
-        .split(" ")
-        .map((n) => n[0])
-        .join("")
-        .toUpperCase()
-        .slice(0, 2),
-      joinedDate: new Date().toISOString().split("T")[0],
-      username: loginUsername || undefined,
-      password: loginPassword || undefined,
-    });
+    try {
+      await onAddTechnician({
+        name,
+        phone,
+        email,
+        position,
+        status,
+        profilePicture: name
+          .split(" ")
+          .map((n) => n[0])
+          .join("")
+          .toUpperCase()
+          .slice(0, 2),
+        joinedDate: new Date().toISOString().split("T")[0],
+        username: loginUsername || undefined,
+        password: loginPassword || undefined,
+      });
 
-    setName("");
-    setPhone("");
-    setEmail("");
-    setLoginUsername("");
-    setLoginPassword("");
-    setShowAddModal(false);
+      setName("");
+      setPhone("");
+      setEmail("");
+      setLoginUsername("");
+      setLoginPassword("");
+      setShowAddModal(false);
+    } catch (err: any) {
+      alert(err?.message || "Failed to add technician.");
+    }
   };
 
   return (

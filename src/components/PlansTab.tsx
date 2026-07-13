@@ -4,8 +4,8 @@ import { AppState, InternetPlan } from "../types";
 
 interface PlansTabProps {
   state: AppState;
-  onAddPlan: (plan: Omit<InternetPlan, "id">) => void;
-  onUpdatePlan: (id: string, updates: Partial<InternetPlan>) => void;
+  onAddPlan: (plan: Omit<InternetPlan, "id">) => void | Promise<void>;
+  onUpdatePlan: (id: string, updates: Partial<InternetPlan>) => void | Promise<void>;
   onDeletePlan?: (id: string) => void | Promise<void>;
 }
 
@@ -20,25 +20,29 @@ export default function PlansTab({ state, onAddPlan, onUpdatePlan, onDeletePlan 
   const [price, setPrice] = useState("");
   const [description, setDescription] = useState("");
 
-  const handleAddSubmit = (e: React.FormEvent) => {
+  const handleAddSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name || !speed || !price) {
       alert("Please fill in required fields.");
       return;
     }
-    onAddPlan({
-      name,
-      speed,
-      monthlyPrice: Number(price),
-      description,
-      status: "Active",
-    });
-    // Reset Form
-    setName("");
-    setSpeed("");
-    setPrice("");
-    setDescription("");
-    setShowAddModal(false);
+    try {
+      await onAddPlan({
+        name,
+        speed,
+        monthlyPrice: Number(price),
+        description,
+        status: "Active",
+      });
+      // Reset Form - only on success
+      setName("");
+      setSpeed("");
+      setPrice("");
+      setDescription("");
+      setShowAddModal(false);
+    } catch (err: any) {
+      alert(err?.message || "Failed to create plan.");
+    }
   };
 
   const handleOpenEdit = (plan: InternetPlan) => {
@@ -50,19 +54,23 @@ export default function PlansTab({ state, onAddPlan, onUpdatePlan, onDeletePlan 
     setShowEditModal(true);
   };
 
-  const handleEditSubmit = (e: React.FormEvent) => {
+  const handleEditSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedPlanId || !name || !speed || !price) return;
 
-    onUpdatePlan(selectedPlanId, {
-      name,
-      speed,
-      monthlyPrice: Number(price),
-      description,
-    });
+    try {
+      await onUpdatePlan(selectedPlanId, {
+        name,
+        speed,
+        monthlyPrice: Number(price),
+        description,
+      });
 
-    setShowEditModal(false);
-    setSelectedPlanId(null);
+      setShowEditModal(false);
+      setSelectedPlanId(null);
+    } catch (err: any) {
+      alert(err?.message || "Failed to save plan changes.");
+    }
   };
 
   const handleDeletePlan = async (plan: InternetPlan) => {

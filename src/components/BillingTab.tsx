@@ -20,13 +20,13 @@ import { AppState, Invoice, Customer } from "../types";
 
 interface BillingTabProps {
   state: AppState;
-  onAddInvoice: (invoice: Omit<Invoice, "id" | "invoiceNumber">) => void;
+  onAddInvoice: (invoice: Omit<Invoice, "id" | "invoiceNumber">) => void | Promise<void>;
   onRecordPayment: (
     id: string,
     paymentMethod: "Cash" | "Bank Transfer" | "Credit Card" | "Mobile Wallet" | "Other",
     details?: { paymentDate?: string; referenceNumber?: string; notes?: string }
-  ) => void;
-  onCancelInvoice: (id: string) => void;
+  ) => void | Promise<void>;
+  onCancelInvoice: (id: string) => void | Promise<void>;
   onGenerateMonthlyInvoices: () => Promise<number>;
 }
 
@@ -105,39 +105,51 @@ export default function BillingTab({
   const averageRevenuePerCustomer =
     activeCount > 0 ? totalPaidRevenue / activeCount : 0;
 
-  const handleCreateInvoiceSubmit = (e: React.FormEvent) => {
+  const handleCreateInvoiceSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!invCustomerId) return;
 
     const customer = state.customers.find((c) => c.id === invCustomerId);
     if (!customer) return;
 
-    onAddInvoice({
-      customerId: invCustomerId,
-      customerName: customer.fullName,
-      billingPeriodStart: invPeriodStart,
-      billingPeriodEnd: invPeriodEnd,
-      dueDate: invDueDate,
-      amount: Number(invAmount),
-      status: "Unpaid",
-    });
+    try {
+      await onAddInvoice({
+        customerId: invCustomerId,
+        customerName: customer.fullName,
+        billingPeriodStart: invPeriodStart,
+        billingPeriodEnd: invPeriodEnd,
+        dueDate: invDueDate,
+        amount: Number(invAmount),
+        status: "Unpaid",
+      });
 
-    setShowCreateModal(false);
+      setShowCreateModal(false);
+    } catch (err: any) {
+      alert(err?.message || "Failed to create invoice.");
+    }
   };
 
-  const handlePaySubmit = (e: React.FormEvent) => {
+  const [isRecordingPayment, setIsRecordingPayment] = useState(false);
+  const handlePaySubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedInvoice) return;
 
-    onRecordPayment(selectedInvoice.id, payMethod, {
-      paymentDate: payDate,
-      referenceNumber: payReference || undefined,
-      notes: payNotes || undefined,
-    });
-    setShowPayModal(false);
-    setSelectedInvoice(null);
-    setPayReference("");
-    setPayNotes("");
+    setIsRecordingPayment(true);
+    try {
+      await onRecordPayment(selectedInvoice.id, payMethod, {
+        paymentDate: payDate,
+        referenceNumber: payReference || undefined,
+        notes: payNotes || undefined,
+      });
+      setShowPayModal(false);
+      setSelectedInvoice(null);
+      setPayReference("");
+      setPayNotes("");
+    } catch (err: any) {
+      alert(err?.message || "Failed to record payment.");
+    } finally {
+      setIsRecordingPayment(false);
+    }
   };
 
   const filteredInvoices = invoices.filter((i) => {
@@ -362,7 +374,14 @@ export default function BillingTab({
                               Pay
                             </button>
                             <button
-                              onClick={() => onCancelInvoice(inv.id)}
+                              onClick={async () => {
+                                if (!confirm(`Cancel invoice ${inv.invoiceNumber || inv.id}? This cannot be undone.`)) return;
+                                try {
+                                  await onCancelInvoice(inv.id);
+                                } catch (err: any) {
+                                  alert(err?.message || "Failed to cancel invoice.");
+                                }
+                              }}
                               className="inline-flex h-8 items-center gap-1 rounded-lg border border-slate-800 bg-slate-900 px-2.5 text-xs font-semibold text-red-400 hover:bg-red-500/10 hover:border-red-500/20 transition-colors cursor-pointer"
                             >
                               Cancel
@@ -498,9 +517,10 @@ export default function BillingTab({
                 </button>
                 <button
                   type="submit"
-                  className="flex-1 rounded-xl bg-green-600 py-2.5 text-xs font-semibold text-white hover:bg-green-500 cursor-pointer"
+                  disabled={isRecordingPayment}
+                  className="flex-1 rounded-xl bg-green-600 py-2.5 text-xs font-semibold text-white hover:bg-green-500 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
                 >
-                  Confirm Payment
+                  {isRecordingPayment ? "Recording..." : "Confirm Payment"}
                 </button>
               </div>
             </form>
